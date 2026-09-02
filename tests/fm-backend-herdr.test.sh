@@ -1525,21 +1525,38 @@ test_projection_close_rechecks_required_agent_state_at_boundary() {
 # while a pane-death removal preserves focus whenever the dying workspace
 # sits behind the focused one (or the focused one is last).
 
-# make_death_lab <dir> <shell-pid>: a fake ps and a fake workspace mover for
+# make_death_lab <dir> <shell-pid> [<foreground-shell-pid>] [<branch-pid>]: a fake ps and a fake workspace mover for
 # the pane-death close fixtures. The mover appends to $FM_FAKE_MOVER_LOG and
 # exits 9 unless $FM_FAKE_MOVER_RESPONSE names a readable response file.
-make_death_lab() {  # <dir> <shell-pid>
-  local dir=$1 pid=$2
+make_death_lab() {  # <dir> <shell-pid> [<foreground-shell-pid>] [<branch-pid>]
+  local dir=$1 shell_pid=$2 foreground_pid=${3:-$2} branch_pid=${4:-}
   mkdir -p "$dir"
-  cat > "$dir/ps" <<SH
+  if [ "$foreground_pid" = "$shell_pid" ]; then
+    cat > "$dir/ps" <<SH
 #!/usr/bin/env bash
 case "\$*" in
-  "-axo pid=,ppid=") printf '1 0\n$pid 1\n' ;;
-  "-p $pid -o stat=") printf 'Ss+\n' ;;
-  "-p $pid -o comm=") printf -- '-zsh\n' ;;
+  "-axo pid=,ppid=") printf '1 0\n$shell_pid 1\n' ;;
+  "-p $shell_pid -o stat=") printf 'Ss+\n' ;;
+  "-p $shell_pid -o comm=") printf -- '-zsh\n' ;;
   *) exit 1 ;;
 esac
 SH
+  else
+    cat > "$dir/ps" <<SH
+#!/usr/bin/env bash
+case "\$*" in
+  "-axo pid=,ppid=")
+    printf '1 0\n$shell_pid 1\n$foreground_pid $shell_pid\n'
+    if [ -n "$branch_pid" ]; then printf '%s %s\n' "$branch_pid" "$shell_pid"; fi
+    ;;
+  "-p $shell_pid -o stat=") printf 'Ss+\n' ;;
+  "-p $foreground_pid -o stat=") printf 'Ss+\n' ;;
+  "-p $shell_pid -o comm=") printf -- '-zsh\n' ;;
+  "-p $foreground_pid -o comm=") printf -- '-zsh\n' ;;
+  *) exit 1 ;;
+esac
+SH
+  fi
   cat > "$dir/mover" <<'SH'
 #!/usr/bin/env bash
 printf '%s\t%s\t%s\n' "$1" "$2" "$3" >> "$FM_FAKE_MOVER_LOG"
@@ -1567,8 +1584,21 @@ SH
   chmod +x "$dir/ps"
 }
 
-process_info_fixture() {  # <pane> <pid> <name> <argv0>
-  printf '{"result":{"type":"pane_process_info","process_info":{"pane_id":"%s","shell_pid":%s,"foreground_process_group_id":%s,"foreground_processes":[{"pid":%s,"name":"%s","argv0":"%s"}]}}}\n' "$1" "$2" "$2" "$2" "$3" "$4"
+process_info_fixture() {  # <pane> <shell-pid> [<foreground-pid>] <name> <argv0>
+  local pane=$1 shell_pid=$2 foreground_pid=$2 name argv0
+  case $# in
+    4)
+      name=$3
+      argv0=$4
+      ;;
+    5)
+      foreground_pid=$3
+      name=$4
+      argv0=$5
+      ;;
+    *) return 1 ;;
+  esac
+  printf '{"result":{"type":"pane_process_info","process_info":{"pane_id":"%s","shell_pid":%s,"foreground_process_group_id":%s,"foreground_processes":[{"pid":%s,"name":"%s","argv0":"%s"}]}}}\n' "$pane" "$shell_pid" "$foreground_pid" "$foreground_pid" "$name" "$argv0"
 }
 
 death_process_info_fixture() {  # <pane> <pid>
@@ -3095,6 +3125,70 @@ test_pane_agent_state_done_lone_idle_shell_becomes_no_agent() {
   shell_log_count=$(grep -c $'pane\x1fprocess-info' "$log")
   [ "$shell_log_count" -eq 2 ] || fail "the lone-shell proof should use one process-info read per classification call, got $shell_log_count"
   pass "herdr recovery: a done registration on one lone idle shell becomes no-agent/dead"
+}
+
+
+# --- nested shell chains: treehouse-style recovery husks --------------------
+
+# A preserved task pane can come back as a nested shell chain: the pane shell
+# still exists, but the visible foreground shell is a child shell in the same
+# worktree. The proof must return the pane shell pid, not refuse just because
+# the foreground pid differs.
+test_pane_idle_shell_pid_accepts_nested_linear_shell_chain() {
+  local dir log resp fb out root_pid=84605 leaf_pid=85430
+  dir="$TMP_ROOT/pane-state-nested-chain"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
+  process_info_fixture w1:p2 "$root_pid" "$leaf_pid" zsh zsh > "$resp/1.out"
+  make_death_lab "$dir" "$root_pid" "$leaf_pid"
+  fb=$(make_herdr_fakebin "$dir")
+  out=$(PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" FM_HERDR_PS_BIN="$dir/ps" FM_BACKEND_HERDR_IDLE_SHELL_PROOF_POLLS=1 \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_pane_idle_shell_pid fmtest w1:p2' "$ROOT")
+  [ "$out" = "$root_pid" ] || fail "a nested idle shell chain should return the pane shell pid $root_pid, got: $out"
+  pass "herdr recovery: a nested idle shell chain still yields the pane shell pid"
+}
+
+# The control-plane classification must collapse a settled done registration on
+# a nested shell chain to dead/no-agent, not keep calling it live just because
+# the pane shell has a child shell in the same worktree.
+test_pane_agent_state_done_nested_shell_chain_collapses() {
+  local dir log resp fb out shell_log_count root_pid=84605 leaf_pid=85430
+  dir="$TMP_ROOT/pane-state-done-nested-chain"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
+  printf '{"result":{"pane":{"pane_id":"w1:p2"}}}\n' > "$resp/1.out"
+  printf '{"result":{"agent":{"agent_status":"done"}}}\n' > "$resp/2.out"
+  process_info_fixture w1:p2 "$root_pid" "$leaf_pid" zsh zsh > "$resp/3.out"
+  printf '{"result":{"pane":{"pane_id":"w1:p2"}}}\n' > "$resp/4.out"
+  printf '{"result":{"agent":{"agent_status":"done"}}}\n' > "$resp/5.out"
+  process_info_fixture w1:p2 "$root_pid" "$leaf_pid" zsh zsh > "$resp/6.out"
+  make_death_lab "$dir" "$root_pid" "$leaf_pid"
+  fb=$(make_herdr_fakebin "$dir")
+  out=$(PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" FM_HERDR_PS_BIN="$dir/ps" FM_BACKEND_HERDR_IDLE_SHELL_PROOF_POLLS=1 \
+    bash -c '. "$0/bin/backends/herdr.sh"; printf "%s\t%s\n" "$(fm_backend_herdr_pane_agent_state fmtest w1:p2)" "$(fm_backend_herdr_agent_state fmtest:w1:p2)"' "$ROOT")
+  [ "$out" = $'no-agent\tdead' ] || fail "settled done+nested-shell should collapse to no-agent/dead, got: $out"
+  shell_log_count=$(grep -c $'pane\x1fprocess-info' "$log")
+  [ "$shell_log_count" -eq 2 ] || fail "the nested-shell proof should use one process-info read per classification call, got $shell_log_count"
+  pass "herdr recovery: a done registration on a nested shell chain becomes no-agent/dead"
+}
+
+# A branching shell tree is ambiguous and must stay live/unknown instead of
+# being mistaken for the recoverable nested-shell chain.
+test_pane_agent_state_done_branching_shell_chain_remains_live() {
+  local dir log resp fb out shell_log_count root_pid=84605 leaf_pid=85430 branch_pid=99999
+  dir="$TMP_ROOT/pane-state-done-branching-chain"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
+  printf '{"result":{"pane":{"pane_id":"w1:p2"}}}\n' > "$resp/1.out"
+  printf '{"result":{"agent":{"agent_status":"done"}}}\n' > "$resp/2.out"
+  process_info_fixture w1:p2 "$root_pid" "$leaf_pid" zsh zsh > "$resp/3.out"
+  process_info_fixture w1:p2 "$root_pid" "$leaf_pid" zsh zsh > "$resp/4.out"
+  printf '{"result":{"pane":{"pane_id":"w1:p2"}}}\n' > "$resp/5.out"
+  printf '{"result":{"agent":{"agent_status":"done"}}}\n' > "$resp/6.out"
+  process_info_fixture w1:p2 "$root_pid" "$leaf_pid" zsh zsh > "$resp/7.out"
+  process_info_fixture w1:p2 "$root_pid" "$leaf_pid" zsh zsh > "$resp/8.out"
+  make_death_lab "$dir" "$root_pid" "$leaf_pid" "$branch_pid"
+  fb=$(make_herdr_fakebin "$dir")
+  out=$(PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" FM_HERDR_PS_BIN="$dir/ps" FM_BACKEND_HERDR_IDLE_SHELL_PROOF_POLLS=1 \
+    bash -c '. "$0/bin/backends/herdr.sh"; printf "%s\t%s\n" "$(fm_backend_herdr_pane_agent_state fmtest w1:p2)" "$(fm_backend_herdr_agent_state fmtest:w1:p2)"' "$ROOT")
+  [ "$out" = $'live\talive' ] || fail "a branching shell chain should stay live/alive, got: $out"
+  shell_log_count=$(grep -c $'pane\x1fprocess-info' "$log")
+  [ "$shell_log_count" -eq 4 ] || fail "the branching chain should be retried and then refused on both classifications, got $shell_log_count process-info reads"
+  pass "herdr recovery: branching shell chains stay live/alive rather than being mistaken for husks"
 }
 
 test_pane_agent_state_done_real_pi_foreground_remains_live() {
@@ -4717,6 +4811,9 @@ test_busy_state_working_maps_to_busy
 test_busy_state_done_and_blocked_map_to_idle
 test_busy_state_unknown_on_no_agent
 test_pane_agent_state_done_lone_idle_shell_becomes_no_agent
+test_pane_idle_shell_pid_accepts_nested_linear_shell_chain
+test_pane_agent_state_done_nested_shell_chain_collapses
+test_pane_agent_state_done_branching_shell_chain_remains_live
 test_pane_agent_state_done_real_pi_foreground_remains_live
 test_pane_agent_state_idle_non_shell_foreground_remains_live
 test_pane_agent_state_unreadable_process_proof_refuses

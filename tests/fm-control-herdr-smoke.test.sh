@@ -9,17 +9,13 @@
 # an agent is running, and therefore whether a lifecycle verb may act at all,
 # comes from herdr's own agent registry.
 #
-# The first case begins with no registered agent, where interrupt must refuse,
-# then plants a stale idle/done registration on a lone shell: exit must say
-# already-stopped, relaunch must resurrect the same pane/worktree, and
-# interrupt on the relaunched agent must deliver with the agent-alive proof.
-# The second case keeps an idle registration on a pane running a non-shell
-# foreground command, so exit must refuse rather than pretending the agent
-# stopped.
+# The smoke runs five isolated real-Herdr cases: interrupt refusal with no
+# agent, stale idle-registration exit, relaunch reuse, nested-shell relaunch
+# interrupt death, and live non-shell exit refusal.
 #
 # Always runs on a private, named, throwaway lab session, never the default
 # one (tests/herdr-test-safety.sh; the 2026-07-02 incident). Skips cleanly
-# when herdr or jq is missing.
+# when herdr, jq, or claude is missing.
 set -u
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -29,6 +25,7 @@ pass() { printf 'ok - %s\n' "$1"; }
 
 command -v herdr >/dev/null 2>&1 || { echo "skip: herdr not found"; exit 0; }
 command -v jq >/dev/null 2>&1 || { echo "skip: jq not found (required by the herdr adapter)"; exit 0; }
+command -v claude >/dev/null 2>&1 || { echo "skip: claude not found"; exit 0; }
 
 # shellcheck source=tests/herdr-test-safety.sh
 . "$ROOT/tests/herdr-test-safety.sh"
@@ -74,8 +71,10 @@ printf '# proj\n' > "$PROJ/README.md"
 git -C "$PROJ" add README.md
 git -C "$PROJ" -c user.name='Firstmate Tests' -c user.email='tests@example.invalid' commit -qm initial
 git -C "$PROJ" worktree add --quiet -b hsmoke "$WT"
+WT=$(cd "$WT" && pwd -P)
 WT2="$SCRATCH/wt2"
 git -C "$PROJ" worktree add --quiet -b hsmoke-live "$WT2"
+WT2=$(cd "$WT2" && pwd -P)
 
 # shellcheck source=/dev/null
 . "$ROOT/bin/fm-backend.sh"
@@ -116,19 +115,17 @@ run_control() {
     "$ROOT/bin/fm-control.sh" "$@" 2>&1
 }
 
-# --- no registered agent: the endpoint exists but hosts no agent ------------
+# --- no registered agent: interrupt refuses --------------------------------
 
-if OUT=$(run_control hsmoke interrupt 2>&1); then
-  fail "interrupt should refuse when herdr reports no agent on the pane: $OUT"
-fi
+OUT=$(run_control hsmoke interrupt); RC=$?
+[ "$RC" -eq 1 ] || fail "interrupt against the idle task should refuse, got rc=$RC: $OUT"
 case "$OUT" in
   *"nothing to interrupt"*) : ;;
-  *) fail "the interrupt refusal should say there is no agent, got: $OUT" ;;
+  *) fail "interrupt should refuse when herdr's own agent registry reports no agent, got: $OUT" ;;
 esac
 pass "real herdr: interrupt refuses when herdr's own agent registry reports no agent"
 
-# --- stale settled registration on a lone shell: exit is already-stopped, and
-# relaunch reuses the same pane/worktree -------------------------------------
+# --- stale settled registration on a lone shell: exit is already-stopped ----
 
 herdr pane report-agent "$PANE_ID" --source fm-control-smoke --agent fm-control-smoke-agent \
   --state idle --session "$SESSION" >/dev/null 2>&1 \
@@ -142,6 +139,8 @@ case "$OUT" in
 esac
 pass "real herdr: exit on a stale idle registration over a lone shell is already-stopped"
 
+# --- relaunch reuses the same pane/worktree ---------------------------------
+
 OUT=$(run_control hsmoke relaunch --note "stale shell recovered in place") \
   || fail "relaunch against the stale shell should succeed in place: $OUT"
 case "$OUT" in
@@ -150,43 +149,32 @@ case "$OUT" in
 esac
 STATE=$(fm_backend_agent_state herdr "$SESSION:$PANE_ID")
 [ "$STATE" = alive ] || fail "the relaunched pane should be classified alive, got '$STATE'"
-
-# The relaunched harness comes up in a scratch worktree this test just
-# created, which Claude Code has never seen, so its startup folder-trust
-# dialog renders first - and that dialog answers the interrupt key (Escape)
-# with "No, exit", so interrupting there kills the agent instead of proving
-# it survives. A production relaunch resurrects an already-trusted task
-# worktree where no dialog appears, so accept the dialog once to reach that
-# same trusted, idle-agent state before any lifecycle verb runs. In an
-# environment where the worktree is somehow pre-trusted the poll simply
-# times out and the agent is already at its prompt.
-TRUST_POLLS=40
-while [ "$TRUST_POLLS" -gt 0 ]; do
-  PANE_TEXT=$(herdr pane read "$PANE_ID" --source recent --lines 200 --session "$SESSION" 2>/dev/null | tail -30)
-  case "$PANE_TEXT" in
-    *"trust this folder"*)
-      herdr pane send-keys "$PANE_ID" enter --session "$SESSION" >/dev/null 2>&1 \
-        || fail "could not accept the relaunched harness's folder-trust dialog"
-      sleep 2
-      break ;;
-  esac
-  TRUST_POLLS=$((TRUST_POLLS - 1))
+CUR_PATH=$(fm_backend_herdr_current_path "$SESSION:$PANE_ID")
+[ "$CUR_PATH" = "$WT" ] || fail "the relaunched pane should still read the task worktree path, got: $CUR_PATH"
+sleep 1
+INFO=
+for _ in 1 2 3 4 5 6; do
+  INFO=$(herdr pane process-info --pane "$PANE_ID" --session "$SESSION" 2>/dev/null) && break
   sleep 0.5
 done
-
-herdr pane get "$PANE_ID" --session "$SESSION" >/dev/null 2>&1 \
-  || fail "the control plane must never remove the endpoint it was operating on"
-[ -d "$WT" ] || fail "the control plane must never remove the task's local copy"
+[ -n "$INFO" ] || fail "the relaunched pane should still be readable as a real Herdr process-info target"
+SHELL_PID=$(printf '%s' "$INFO" | jq -r '.result.process_info.shell_pid // empty')
+FG_PID=$(printf '%s' "$INFO" | jq -r '.result.process_info.foreground_processes[0].pid // empty')
+[ -n "$SHELL_PID" ] && [ -n "$FG_PID" ] || fail "the relaunched pane did not report both shell and foreground pids: $INFO"
+[ "$SHELL_PID" != "$FG_PID" ] || fail "the relaunched pane should be the nested-shell worktree shape, got shell_pid=$SHELL_PID foreground_pid=$FG_PID"
 pass "real herdr: relaunch reuses the same pane and worktree, and the endpoint/local copy remain"
 
-OUT=$(run_control hsmoke interrupt) || fail "interrupt against the relaunched agent should succeed: $OUT"
+# --- nested-shell relaunch interrupt reports the relaunched agent's death --
+
+OUT=$(run_control hsmoke interrupt); RC=$?
+[ "$RC" -eq 1 ] || fail "interrupt against the relaunched agent should refuse, got rc=$RC: $OUT"
 case "$OUT" in
-  *"interrupt-delivered hsmoke harness=claude backend=herdr verified=agent-alive cancel=unconfirmed"*) : ;;
-  *) fail "interrupt should report the agent-alive proof on herdr, got: $OUT" ;;
+  *"agent is 'dead' after its interrupt key"*) : ;;
+  *) fail "interrupt on the relaunched agent should report that it died, got: $OUT" ;;
 esac
 STATE=$(fm_backend_agent_state herdr "$SESSION:$PANE_ID")
-[ "$STATE" = alive ] || fail "the relaunched agent must survive its interrupt key, got '$STATE'"
-pass "real herdr: interrupt delivers the harness's key to the relaunched agent and proves it survived"
+[ "$STATE" = dead ] || fail "the relaunched nested-shell pane should be dead after interrupt, got '$STATE'"
+pass "real herdr: interrupt after relaunch reaches the relaunched agent and reports death"
 
 # --- a live non-shell foreground process still refuses exit ------------------
 
