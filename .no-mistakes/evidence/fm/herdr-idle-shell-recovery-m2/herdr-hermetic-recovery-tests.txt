@@ -1,0 +1,12 @@
+# Hermetic herdr backend regressions - recovery classifier + busy-state lines
+# bash tests/fm-backend-herdr.test.sh -> exit 0, 187 ok
+ok - fm_backend_herdr_create_task: closes and replaces a same-labeled tab whose pane is alive but hosts no registered agent (a restored plain shell)
+ok - fm_backend_herdr_busy_state: working -> busy
+ok - fm_backend_herdr_busy_state: done -> idle, blocked -> idle (surfaced like a stale pane, not suppressed as busy)
+ok - fm_backend_herdr_busy_state: unparseable/absent agent state reports unknown, the regex-fallback cue
+ok - herdr recovery: a done registration on one lone idle shell becomes no-agent/dead
+ok - herdr recovery: a settled Pi foreground process remains live/alive
+ok - herdr recovery: a non-shell foreground process remains live/alive
+ok - herdr recovery: unreadable process evidence refuses rather than being treated as stopped
+ok - fm_backend_herdr_rendered_busy_state: busy/idle/unknown from the rendered footer, with an unreadable pane never reading idle
+ok - fm_backend_busy_state: tmux (no native primitive) always reports unknown, preserving the P1 regex-only path
