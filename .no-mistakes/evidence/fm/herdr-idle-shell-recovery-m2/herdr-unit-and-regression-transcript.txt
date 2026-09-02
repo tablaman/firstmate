@@ -1,0 +1,17 @@
+== Targeted hermetic unit tests (tests/fm-backend-herdr.test.sh, new/changed idle-shell recovery cases) at target e65b327 ==
+ok - fm_backend_herdr_create_task: closes and replaces a same-labeled tab whose settled done agent collapses to a lone idle shell husk
+ok - herdr recovery: a done registration on one lone idle shell becomes no-agent/dead
+ok - herdr recovery: a nested idle shell chain still yields the pane shell pid
+ok - herdr recovery: a done registration on a nested shell chain becomes no-agent/dead
+ok - herdr recovery: branching shell chains stay live/alive rather than being mistaken for husks
+ok - herdr recovery: a settled Pi foreground process remains live/alive
+ok - herdr recovery: a non-shell foreground process remains live/alive
+ok - herdr recovery: a live pi foreground classifies live on the first proof sample without burning the settle budget
+ok - herdr recovery: a transient prompt-helper sample still settles to the proven idle shell
+ok - herdr recovery: unreadable process evidence refuses rather than being treated as stopped
+ok - herdr presentation recovery: duplicate-token inspection is read-only and live-agent risk refuses fallback
+runner-exit=
+
+== Regression proof: same nested-idle-shell-chain fixture against BASE 77ee3c8 bin/backends/herdr.sh (pre-fix) ==
+not ok - a nested idle shell chain should return the pane shell pid 84605, got: 
+(refusal above = pre-fix behavior the change repairs; the same test passes against the target tree)
