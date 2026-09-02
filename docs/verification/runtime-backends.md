@@ -645,18 +645,24 @@ The test's first case begins with no registered agent, then plants a stale idle/
 The second case keeps an idle registration over a non-shell foreground command, so exit must refuse rather than pretending the agent stopped.
 The registry read through `herdr pane report-agent` is the same source `fm_backend_herdr_agent_state` classifies, so these cases exercise exactly the gate every lifecycle verb depends on.
 The lone-shell legs require the pane's interactive shell to come up bare; an operator shell shim that wraps the pane shell defeats the strict lone-idle-shell proof, and the proof's refusal there is correct behavior, not a test defect.
+Because the lab's pane shells inherit the environment of whatever terminal launched the test, a fig/Amazon Q/kiro-cli terminal integration in the operator's shell rc would wrap them in its `kiro-cli-term` pty shim exactly when the invoking terminal was NOT itself already wrapped - making the lone-shell legs pass or fail on where the test was started from (diagnosed 2026-09-03 by pane process-info: the wrapped pane's foreground process is `zsh (kiro-cli-term)` with a child `/bin/zsh --login`).
+The test therefore exports the integration's own suppress markers (`PROCESS_LAUNCHED_BY_Q`, `Q_TERM`) before provisioning the lab so pane shells deterministically come up bare.
 
-On 2026-09-03 with Herdr 0.8.0 the idle-shell recovery legs passed against the real binary:
+On 2026-09-03 with Herdr 0.8.0 the full rewritten test passed against the real binary:
 
 ```text
 ok - real herdr: interrupt refuses when herdr's own agent registry reports no agent
 ok - real herdr: exit on a stale idle registration over a lone shell is already-stopped
 ok - real herdr: relaunch reuses the same pane and worktree, and the endpoint/local copy remain
+ok - real herdr: interrupt delivers the harness's key to the relaunched agent and proves it survived
+ok - real herdr: a live non-shell foreground process stays live and refuses exit
 ```
 
-The relaunched-agent interrupt-survival leg launches and holds a real agent, which the sandboxed run that produced the record above could not sustain; it last fully passed under the pre-rewrite test revision reverified 2026-08-08 on Herdr 0.8.0 (first measured 2026-08-02 on Herdr 0.7.5).
-The non-shell foreground exit-refusal leg runs after that leg in the same script, so it is pinned hermetically in `tests/fm-backend-herdr.test.sh` pending its first real-binary pass.
-That command is the guard that refreshes this record; run the full test after every Herdr upgrade rather than trusting the versions above.
+Two properties of the live environment gate the last two legs, and the test now accounts for both.
+The relaunched harness comes up in a scratch worktree Claude Code has never trusted, so its startup folder-trust dialog renders first and answers the interrupt key (Escape) with "No, exit" - interrupting there kills the agent instead of proving survival, so the test accepts the dialog once after relaunch (a production relaunch resurrects an already-trusted worktree where no dialog appears; diagnosed by pane capture during the 2026-09-03 run).
+The non-shell stand-in must outlast the whole exit verb, whose delivery-confirmation cycle can exceed a minute against a live server; a stand-in that expires mid-verb collapses the pane to a genuine lone idle shell and makes a later `stopped` a correct observation of the wrong scenario.
+The non-shell exit-refusal semantics are additionally pinned hermetically in `tests/fm-backend-herdr.test.sh`.
+That command is the guard that refreshes this record; run the full test after every Herdr upgrade rather than trusting the versions above (interrupt-survival previously measured 2026-08-02 on Herdr 0.7.5 and 2026-08-08 on Herdr 0.8.0 under the pre-rewrite test revision).
 
 ### Away-mode transport
 

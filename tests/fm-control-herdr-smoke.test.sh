@@ -38,10 +38,25 @@ SESSION="fm-lab-control-smoke-$$"
 export HERDR_SESSION="$SESSION"
 SCRATCH=
 cleanup_all() {
+  trap - EXIT
   [ -n "$SCRATCH" ] && rm -rf "$SCRATCH"
   herdr_safe_stop_and_delete "$SESSION"
 }
 trap cleanup_all EXIT
+
+# The lone-shell legs require the pane's interactive shell to come up bare,
+# and pane shells inherit the lab server's environment, which inherits this
+# test's. An operator terminal-integration shim (fig/Amazon Q/kiro-cli's
+# kiro-cli-term) execs the pane's zsh into a pty wrapper with a child shell,
+# which the strict lone-idle-shell proof then correctly refuses to collapse -
+# so whether legs 2-5 can even observe the recovery behavior would depend on
+# whether the terminal that launched the test was itself already wrapped
+# (those markers suppress re-wrapping). Export the integration's own
+# "already wrapped / launched by the tool" markers so the lab's pane shells
+# deterministically skip the shim regardless of the invoking terminal.
+export PROCESS_LAUNCHED_BY_Q=1
+export Q_TERM=1
+
 fm_herdr_lab_provision "$SESSION" || fail "could not provision isolated Herdr lab session"
 
 SCRATCH=$(mktemp -d "${TMPDIR:-/tmp}/fm-control-herdr.XXXXXX")
@@ -136,6 +151,29 @@ esac
 STATE=$(fm_backend_agent_state herdr "$SESSION:$PANE_ID")
 [ "$STATE" = alive ] || fail "the relaunched pane should be classified alive, got '$STATE'"
 
+# The relaunched harness comes up in a scratch worktree this test just
+# created, which Claude Code has never seen, so its startup folder-trust
+# dialog renders first - and that dialog answers the interrupt key (Escape)
+# with "No, exit", so interrupting there kills the agent instead of proving
+# it survives. A production relaunch resurrects an already-trusted task
+# worktree where no dialog appears, so accept the dialog once to reach that
+# same trusted, idle-agent state before any lifecycle verb runs. In an
+# environment where the worktree is somehow pre-trusted the poll simply
+# times out and the agent is already at its prompt.
+TRUST_POLLS=40
+while [ "$TRUST_POLLS" -gt 0 ]; do
+  PANE_TEXT=$(herdr pane read "$PANE_ID" --source recent --lines 200 --session "$SESSION" 2>/dev/null | tail -30)
+  case "$PANE_TEXT" in
+    *"trust this folder"*)
+      herdr pane send-keys "$PANE_ID" enter --session "$SESSION" >/dev/null 2>&1 \
+        || fail "could not accept the relaunched harness's folder-trust dialog"
+      sleep 2
+      break ;;
+  esac
+  TRUST_POLLS=$((TRUST_POLLS - 1))
+  sleep 0.5
+done
+
 herdr pane get "$PANE_ID" --session "$SESSION" >/dev/null 2>&1 \
   || fail "the control plane must never remove the endpoint it was operating on"
 [ -d "$WT" ] || fail "the control plane must never remove the task's local copy"
@@ -182,7 +220,14 @@ herdr pane report-agent "$PANE2_ID" --source fm-control-smoke --agent fm-control
   || fail "could not register the live non-shell refusal agent"
 sleep 1
 
-OUT=$(fm_backend_herdr_send_text_line "$SESSION:$PANE2_ID" "sleep 60") \
+# The stand-in process must outlast the whole exit verb, not just its final
+# postcondition wait: exit's delivery confirmation (Enter retries, native
+# agent-state waits, composer verdicts, and the idle-branch shell proof's own
+# retry budget on every classification) can take over a minute against a live
+# server. A sleep that expires mid-verb collapses the pane to a genuine lone
+# idle shell, so a later 'stopped' would be a correct observation of the wrong
+# scenario rather than the refusal this leg pins.
+OUT=$(fm_backend_herdr_send_text_line "$SESSION:$PANE2_ID" "sleep 600") \
   || fail "could not start the non-shell foreground process"
 sleep 0.5
 STATE=$(fm_backend_agent_state herdr "$SESSION:$PANE2_ID")
