@@ -3233,6 +3233,51 @@ test_pane_agent_state_idle_non_shell_foreground_remains_live() {
   pass "herdr recovery: a non-shell foreground process remains live/alive"
 }
 
+# A conclusively non-shell lone foreground process (a live harness like pi)
+# must classify live on the FIRST proof sample even with a multi-poll settle
+# budget: the retry window exists only for transient shell-shaped ambiguity.
+# The query count is the proof - one process-info read for the shell proof
+# plus one for the live fallback, per classification, never one per poll.
+test_pane_agent_state_pi_foreground_fails_fast_within_poll_budget() {
+  local dir log resp fb out shell_log_count
+  dir="$TMP_ROOT/pane-state-pi-fail-fast"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
+  printf '{"result":{"pane":{"pane_id":"w1:p2"}}}\n' > "$resp/1.out"
+  printf '{"result":{"agent":{"agent_status":"idle"}}}\n' > "$resp/2.out"
+  process_info_fixture w1:p2 67 pi pi > "$resp/3.out"
+  process_info_fixture w1:p2 67 pi pi > "$resp/4.out"
+  printf '{"result":{"pane":{"pane_id":"w1:p2"}}}\n' > "$resp/5.out"
+  printf '{"result":{"agent":{"agent_status":"idle"}}}\n' > "$resp/6.out"
+  process_info_fixture w1:p2 67 pi pi > "$resp/7.out"
+  process_info_fixture w1:p2 67 pi pi > "$resp/8.out"
+  make_refusal_ps_stub "$dir"
+  fb=$(make_herdr_fakebin "$dir")
+  out=$(PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" FM_HERDR_PS_BIN="$dir/ps" FM_BACKEND_HERDR_IDLE_SHELL_PROOF_POLLS=5 \
+    bash -c '. "$0/bin/backends/herdr.sh"; printf "%s\t%s\n" "$(fm_backend_herdr_pane_agent_state fmtest w1:p2)" "$(fm_backend_herdr_agent_state fmtest:w1:p2)"' "$ROOT")
+  [ "$out" = $'live\talive' ] || fail "a live pi foreground should stay live/alive under a multi-poll budget, got: $out"
+  shell_log_count=$(grep -c $'pane\x1fprocess-info' "$log")
+  [ "$shell_log_count" -eq 4 ] || fail "a conclusively non-shell foreground should refuse on the first proof sample, got $shell_log_count process-info reads"
+  pass "herdr recovery: a live pi foreground classifies live on the first proof sample without burning the settle budget"
+}
+
+# The settle retry itself must survive the fail-fast: a transient prompt
+# helper (the lab-verified starship redraw) makes the shell-shaped sample
+# ambiguous, and the very next clean sample must still complete the proof.
+test_pane_idle_shell_pid_retries_transient_prompt_helper_sample() {
+  local dir log resp fb out shell_log_count
+  dir="$TMP_ROOT/pane-state-prompt-helper"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
+  printf '{"result":{"type":"pane_process_info","process_info":{"pane_id":"w1:p2","shell_pid":67,"foreground_process_group_id":67,"foreground_processes":[{"pid":67,"name":"zsh","argv0":"zsh"},{"pid":68,"name":"starship","argv0":"starship"}]}}}\n' > "$resp/1.out"
+  death_process_info_fixture w1:p2 67 > "$resp/2.out"
+  make_death_lab "$dir" 67
+  fb=$(make_herdr_fakebin "$dir")
+  out=$(PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" FM_HERDR_PS_BIN="$dir/ps" FM_BACKEND_HERDR_IDLE_SHELL_PROOF_POLLS=3 \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_pane_idle_shell_pid fmtest w1:p2' "$ROOT") \
+    || fail "a transient prompt-helper sample followed by a clean sample should still prove the idle shell"
+  [ "$out" = 67 ] || fail "the settled proof should return the pane shell pid, got: $out"
+  shell_log_count=$(grep -c $'pane\x1fprocess-info' "$log")
+  [ "$shell_log_count" -eq 2 ] || fail "the transient sample should be retried exactly once before the clean sample succeeds, got $shell_log_count process-info reads"
+  pass "herdr recovery: a transient prompt-helper sample still settles to the proven idle shell"
+}
+
 test_pane_agent_state_unreadable_process_proof_refuses() {
   local dir log resp fb out shell_log_count
   dir="$TMP_ROOT/pane-state-unreadable"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
@@ -4816,6 +4861,8 @@ test_pane_agent_state_done_nested_shell_chain_collapses
 test_pane_agent_state_done_branching_shell_chain_remains_live
 test_pane_agent_state_done_real_pi_foreground_remains_live
 test_pane_agent_state_idle_non_shell_foreground_remains_live
+test_pane_agent_state_pi_foreground_fails_fast_within_poll_budget
+test_pane_idle_shell_pid_retries_transient_prompt_helper_sample
 test_pane_agent_state_unreadable_process_proof_refuses
 test_composer_state_bare_prompt_is_empty
 test_composer_state_styled_placeholder_draft_is_pending

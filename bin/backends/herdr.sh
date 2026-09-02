@@ -1186,16 +1186,22 @@ fm_backend_herdr_pid_is_bare_shell() {  # <ps-bin> <pid>
 # (verified on the real 0.7.5 lab: a workspace.move relayout makes zsh redraw
 # its prompt, spawning starship as a second foreground process for a few
 # samples), so the proof retries strict single samples for a bounded settle
-# window and succeeds on the first fully clean one; a genuinely busy pane or
-# any ambiguous chain fails every sample and still refuses.
+# window and succeeds on the first fully clean one. The settle window exists
+# only for that shell-shaped ambiguity: when a sample observes the pane's lone
+# foreground process as a conclusively non-shell program (sample exit 2 - a
+# live harness like pi, never a prompt helper hosted by an idle shell), the
+# proof refuses immediately instead of spending the remaining poll budget.
+# Every other failing sample - busy, branching, or unreadable evidence - is
+# retried and still refuses at the end of the window.
 # This is the single owner of the idle-shell proof; the session-start
 # projection cleanup and every pane-death close path both rely on it.
 fm_backend_herdr_pane_idle_shell_pid() {  # <session> <pane-id>
-  local attempt=0 max_attempts=${FM_BACKEND_HERDR_IDLE_SHELL_PROOF_POLLS:-10}
+  local attempt=0 max_attempts=${FM_BACKEND_HERDR_IDLE_SHELL_PROOF_POLLS:-10} rc
   while :; do
-    if fm_backend_herdr_pane_idle_shell_sample "$1" "$2"; then
-      return 0
-    fi
+    rc=0
+    fm_backend_herdr_pane_idle_shell_sample "$1" "$2" || rc=$?
+    [ "$rc" -eq 0 ] && return 0
+    [ "$rc" -eq 2 ] && return 1
     attempt=$((attempt + 1))
     [ "$attempt" -lt "$max_attempts" ] || return 1
     sleep 0.1
@@ -1204,7 +1210,11 @@ fm_backend_herdr_pane_idle_shell_pid() {  # <session> <pane-id>
 
 # fm_backend_herdr_pane_idle_shell_sample: one strict instantaneous
 # observation for fm_backend_herdr_pane_idle_shell_pid, which owns the proof
-# contract and the settle retry.
+# contract and the settle retry. Exit 0 prints the pane shell pid; exit 2
+# means the lone foreground process resolved to a conclusively non-shell
+# program (name and argv0 agree it is not a recognized shell), so the owner
+# may refuse without further settle samples; exit 1 is every other failure
+# and stays retryable.
 fm_backend_herdr_pane_idle_shell_sample() {  # <session> <pane-id>
   local session=$1 pane=$2 info shell_pid foreground_pgid count
   local foreground_pid name argv0 shell_name rows stat ps_bin current parent child_count hops max_hops
@@ -1233,8 +1243,14 @@ fm_backend_herdr_pane_idle_shell_sample() {  # <session> <pane-id>
   shell_name=${name##*/}
   argv0=${argv0#-}
   argv0=${argv0##*/}
-  [ "$argv0" = "$shell_name" ] || return 1
-  case "$shell_name" in sh|bash|zsh|dash|ksh|fish) ;; *) return 1 ;; esac
+  case "$shell_name" in
+    sh|bash|zsh|dash|ksh|fish)
+      [ "$argv0" = "$shell_name" ] || return 1
+      ;;
+    *)
+      case "$argv0" in sh|bash|zsh|dash|ksh|fish) return 1 ;; *) return 2 ;; esac
+      ;;
+  esac
 
   ps_bin=${FM_HERDR_PS_BIN:-ps}
   command -v "$ps_bin" >/dev/null 2>&1 || return 1
