@@ -9,9 +9,10 @@
 # an agent is running, and therefore whether a lifecycle verb may act at all,
 # comes from herdr's own agent registry.
 #
-# The first case starts with a stale idle/done registration on a lone shell:
-# exit must say already-stopped, relaunch must resurrect the same pane/worktree,
-# and interrupt on the relaunched agent must still work.
+# The first case begins with no registered agent, where interrupt must refuse,
+# then plants a stale idle/done registration on a lone shell: exit must say
+# already-stopped, relaunch must resurrect the same pane/worktree, and
+# interrupt on the relaunched agent must deliver with the agent-alive proof.
 # The second case keeps an idle registration on a pane running a non-shell
 # foreground command, so exit must refuse rather than pretending the agent
 # stopped.
@@ -100,6 +101,17 @@ run_control() {
     "$ROOT/bin/fm-control.sh" "$@" 2>&1
 }
 
+# --- no registered agent: the endpoint exists but hosts no agent ------------
+
+if OUT=$(run_control hsmoke interrupt 2>&1); then
+  fail "interrupt should refuse when herdr reports no agent on the pane: $OUT"
+fi
+case "$OUT" in
+  *"nothing to interrupt"*) : ;;
+  *) fail "the interrupt refusal should say there is no agent, got: $OUT" ;;
+esac
+pass "real herdr: interrupt refuses when herdr's own agent registry reports no agent"
+
 # --- stale settled registration on a lone shell: exit is already-stopped, and
 # relaunch reuses the same pane/worktree -------------------------------------
 
@@ -128,6 +140,15 @@ herdr pane get "$PANE_ID" --session "$SESSION" >/dev/null 2>&1 \
   || fail "the control plane must never remove the endpoint it was operating on"
 [ -d "$WT" ] || fail "the control plane must never remove the task's local copy"
 pass "real herdr: relaunch reuses the same pane and worktree, and the endpoint/local copy remain"
+
+OUT=$(run_control hsmoke interrupt) || fail "interrupt against the relaunched agent should succeed: $OUT"
+case "$OUT" in
+  *"interrupt-delivered hsmoke harness=claude backend=herdr verified=agent-alive cancel=unconfirmed"*) : ;;
+  *) fail "interrupt should report the agent-alive proof on herdr, got: $OUT" ;;
+esac
+STATE=$(fm_backend_agent_state herdr "$SESSION:$PANE_ID")
+[ "$STATE" = alive ] || fail "the relaunched agent must survive its interrupt key, got '$STATE'"
+pass "real herdr: interrupt delivers the harness's key to the relaunched agent and proves it survived"
 
 # --- a live non-shell foreground process still refuses exit ------------------
 
