@@ -715,6 +715,34 @@ EOF
   pass "fm_backend_herdr_create_task: closes and replaces a same-labeled tab whose pane is alive but hosts no registered agent (a restored plain shell)"
 }
 
+test_create_task_closes_and_replaces_done_shell_husk() {
+  local dir log resp fb out tab pane
+  dir="$TMP_ROOT/husk-done-shell"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
+  printf '{"result":{"tabs":[{"tab_id":"w1:t2","label":"fm-husk3","workspace_id":"w1"}]}}\n' > "$resp/1.out"
+  printf '{"result":{"panes":[{"pane_id":"w1:p2","tab_id":"w1:t2"}]}}\n' > "$resp/2.out"
+  printf '{"result":{"pane":{"pane_id":"w1:p2"}}}\n' > "$resp/3.out"
+  printf '{"result":{"agent":{"agent_status":"done"}}}\n' > "$resp/4.out"
+  death_process_info_fixture w1:p2 67 > "$resp/5.out"
+  printf '{"result":{"tab":{"tab_id":"w1:t3"},"root_pane":{"pane_id":"w1:p3"}}}\n' > "$resp/6.out"
+  printf '{"result":{"tabs":[{"tab_id":"w1:t3","label":"fm-husk3","workspace_id":"w1"}]}}\n' > "$resp/8.out"
+  make_death_lab "$dir" 67
+  fb=$(make_herdr_fakebin "$dir")
+  out=$(PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" FM_HERDR_PS_BIN="$dir/ps" FM_BACKEND_HERDR_IDLE_SHELL_PROOF_POLLS=1 \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_create_task fmtest:w1 fm-husk3 /tmp/proj' "$ROOT") \
+    || fail "create_task should close-and-replace a done shell husk instead of refusing"
+  read -r tab pane <<EOF
+$out
+EOF
+  if [ "$tab" != "w1:t3" ] || [ "$pane" != "w1:p3" ]; then
+    fail "create_task should echo the NEW tab/pane ids, got '$out'"
+  fi
+  assert_contains "$(cat "$log")" $'pane\x1fprocess-info' "create_task did not use the strict idle-shell proof"
+  assert_contains "$(cat "$log")" $'tab\x1fcreate\x1f--workspace\x1fw1\x1f--cwd\x1f/tmp/proj\x1f--label\x1ffm-husk3' \
+    "create_task did not create the replacement tab"
+  assert_contains "$(cat "$log")" $'tab\x1fclose\x1fw1:t2' "create_task did not close the done shell husk's tab"
+  pass "fm_backend_herdr_create_task: closes and replaces a same-labeled tab whose settled done agent collapses to a lone idle shell husk"
+}
+
 test_create_task_closes_all_duplicate_husks_after_replacement() {
   local dir log resp fb out tab pane create_line close_p2_line close_p3_line
   dir="$TMP_ROOT/husk-multiple"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
@@ -1530,8 +1558,21 @@ SH
   : > "$dir/mover.log"
 }
 
+make_refusal_ps_stub() {  # <dir> -> echoes a ps stub that never confirms the proof
+  local dir=$1
+  cat > "$dir/ps" <<'SH'
+#!/usr/bin/env bash
+exit 1
+SH
+  chmod +x "$dir/ps"
+}
+
+process_info_fixture() {  # <pane> <pid> <name> <argv0>
+  printf '{"result":{"type":"pane_process_info","process_info":{"pane_id":"%s","shell_pid":%s,"foreground_process_group_id":%s,"foreground_processes":[{"pid":%s,"name":"%s","argv0":"%s"}]}}}\n' "$1" "$2" "$2" "$2" "$3" "$4"
+}
+
 death_process_info_fixture() {  # <pane> <pid>
-  printf '{"result":{"type":"pane_process_info","process_info":{"pane_id":"%s","shell_pid":%s,"foreground_process_group_id":%s,"foreground_processes":[{"pid":%s,"name":"zsh","argv0":"zsh"}]}}}\n' "$1" "$2" "$2" "$2"
+  process_info_fixture "$1" "$2" zsh zsh
 }
 
 test_projection_close_emptying_after_focus_uses_pane_death_without_move() {
@@ -2825,7 +2866,9 @@ test_projection_recovery_is_read_only_and_refuses_live_duplicate_risk() {
   printf '{"result":{"panes":[{"pane_id":"w1:p1","tab_id":"w1:t1"}]}}\n' > "$resp/2.out"
   printf '{"result":{"pane":{"pane_id":"w1:p1"}}}\n' > "$resp/3.out"
   printf '{"result":{"agent":{"agent_status":"idle"}}}\n' > "$resp/4.out"
-  out=$(PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
+  process_info_fixture w1:p1 67 sleep sleep > "$resp/5.out"
+  process_info_fixture w1:p1 67 sleep sleep > "$resp/6.out"
+  out=$(PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" FM_BACKEND_HERDR_IDLE_SHELL_PROOF_POLLS=1 \
     bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_projection_recovery_allows_flat fmtest "$1" task-p3' "$ROOT" "$journal" 2>&1)
   status=$?
   [ "$status" -ne 0 ] || fail "a token match with a live registered agent must refuse duplicate launch"
@@ -3033,6 +3076,88 @@ test_busy_state_unknown_on_no_agent() {
     bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_busy_state default:w1:p2' "$ROOT" )
   [ "$out" = unknown ] || fail "a failed agent get should report unknown (the fallback-to-regex cue), got '$out'"
   pass "fm_backend_herdr_busy_state: unparseable/absent agent state reports unknown, the regex-fallback cue"
+}
+
+test_pane_agent_state_done_lone_idle_shell_becomes_no_agent() {
+  local dir log resp fb out shell_log_count
+  dir="$TMP_ROOT/pane-state-done-shell"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
+  printf '{"result":{"pane":{"pane_id":"w1:p2"}}}\n' > "$resp/1.out"
+  printf '{"result":{"agent":{"agent_status":"done"}}}\n' > "$resp/2.out"
+  death_process_info_fixture w1:p2 67 > "$resp/3.out"
+  printf '{"result":{"pane":{"pane_id":"w1:p2"}}}\n' > "$resp/4.out"
+  printf '{"result":{"agent":{"agent_status":"done"}}}\n' > "$resp/5.out"
+  death_process_info_fixture w1:p2 67 > "$resp/6.out"
+  make_death_lab "$dir" 67
+  fb=$(make_herdr_fakebin "$dir")
+  out=$(PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" FM_HERDR_PS_BIN="$dir/ps" FM_BACKEND_HERDR_IDLE_SHELL_PROOF_POLLS=1 \
+    bash -c '. "$0/bin/backends/herdr.sh"; printf "%s\t%s\n" "$(fm_backend_herdr_pane_agent_state fmtest w1:p2)" "$(fm_backend_herdr_agent_state fmtest:w1:p2)"' "$ROOT")
+  [ "$out" = $'no-agent\tdead' ] || fail "settled done+shell should collapse to no-agent/dead, got: $out"
+  shell_log_count=$(grep -c $'pane\x1fprocess-info' "$log")
+  [ "$shell_log_count" -eq 2 ] || fail "the lone-shell proof should use one process-info read per classification call, got $shell_log_count"
+  pass "herdr recovery: a done registration on one lone idle shell becomes no-agent/dead"
+}
+
+test_pane_agent_state_done_real_pi_foreground_remains_live() {
+  local dir log resp fb out shell_log_count
+  dir="$TMP_ROOT/pane-state-done-pi"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
+  printf '{"result":{"pane":{"pane_id":"w1:p2"}}}\n' > "$resp/1.out"
+  printf '{"result":{"agent":{"agent_status":"done"}}}\n' > "$resp/2.out"
+  process_info_fixture w1:p2 67 pi pi > "$resp/3.out"
+  process_info_fixture w1:p2 67 pi pi > "$resp/4.out"
+  printf '{"result":{"pane":{"pane_id":"w1:p2"}}}\n' > "$resp/5.out"
+  printf '{"result":{"agent":{"agent_status":"done"}}}\n' > "$resp/6.out"
+  process_info_fixture w1:p2 67 pi pi > "$resp/7.out"
+  process_info_fixture w1:p2 67 pi pi > "$resp/8.out"
+  make_refusal_ps_stub "$dir"
+  fb=$(make_herdr_fakebin "$dir")
+  out=$(PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" FM_HERDR_PS_BIN="$dir/ps" FM_BACKEND_HERDR_IDLE_SHELL_PROOF_POLLS=1 \
+    bash -c '. "$0/bin/backends/herdr.sh"; printf "%s\t%s\n" "$(fm_backend_herdr_pane_agent_state fmtest w1:p2)" "$(fm_backend_herdr_agent_state fmtest:w1:p2)"' "$ROOT")
+  [ "$out" = $'live\talive' ] || fail "a real Pi foreground process should stay live/alive, got: $out"
+  shell_log_count=$(grep -c $'pane\x1fprocess-info' "$log")
+  [ "$shell_log_count" -eq 4 ] || fail "the live Pi fallback should re-read process-info after the failed shell proof on both classifications, got $shell_log_count"
+  pass "herdr recovery: a settled Pi foreground process remains live/alive"
+}
+
+test_pane_agent_state_idle_non_shell_foreground_remains_live() {
+  local dir log resp fb out shell_log_count
+  dir="$TMP_ROOT/pane-state-idle-sleep"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
+  printf '{"result":{"pane":{"pane_id":"w1:p2"}}}\n' > "$resp/1.out"
+  printf '{"result":{"agent":{"agent_status":"idle"}}}\n' > "$resp/2.out"
+  process_info_fixture w1:p2 67 sleep sleep > "$resp/3.out"
+  process_info_fixture w1:p2 67 sleep sleep > "$resp/4.out"
+  printf '{"result":{"pane":{"pane_id":"w1:p2"}}}\n' > "$resp/5.out"
+  printf '{"result":{"agent":{"agent_status":"idle"}}}\n' > "$resp/6.out"
+  process_info_fixture w1:p2 67 sleep sleep > "$resp/7.out"
+  process_info_fixture w1:p2 67 sleep sleep > "$resp/8.out"
+  make_refusal_ps_stub "$dir"
+  fb=$(make_herdr_fakebin "$dir")
+  out=$(PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" FM_HERDR_PS_BIN="$dir/ps" FM_BACKEND_HERDR_IDLE_SHELL_PROOF_POLLS=1 \
+    bash -c '. "$0/bin/backends/herdr.sh"; printf "%s\t%s\n" "$(fm_backend_herdr_pane_agent_state fmtest w1:p2)" "$(fm_backend_herdr_agent_state fmtest:w1:p2)"' "$ROOT")
+  [ "$out" = $'live\talive' ] || fail "a non-shell foreground process should stay live/alive, got: $out"
+  shell_log_count=$(grep -c $'pane\x1fprocess-info' "$log")
+  [ "$shell_log_count" -eq 4 ] || fail "the non-shell fallback should re-read process-info after the failed shell proof on both classifications, got $shell_log_count"
+  pass "herdr recovery: a non-shell foreground process remains live/alive"
+}
+
+test_pane_agent_state_unreadable_process_proof_refuses() {
+  local dir log resp fb out shell_log_count
+  dir="$TMP_ROOT/pane-state-unreadable"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
+  printf '{"result":{"pane":{"pane_id":"w1:p2"}}}\n' > "$resp/1.out"
+  printf '{"result":{"agent":{"agent_status":"done"}}}\n' > "$resp/2.out"
+  printf '{"result":{"type":"pane_process_info","process_info":{"pane_id":"w1:p2","shell_pid":67,"foreground_process_group_id":67}}}\n' > "$resp/3.out"
+  printf '{"result":{"type":"pane_process_info","process_info":{"pane_id":"w1:p2","shell_pid":67,"foreground_process_group_id":67}}}\n' > "$resp/4.out"
+  printf '{"result":{"pane":{"pane_id":"w1:p2"}}}\n' > "$resp/5.out"
+  printf '{"result":{"agent":{"agent_status":"done"}}}\n' > "$resp/6.out"
+  printf '{"result":{"type":"pane_process_info","process_info":{"pane_id":"w1:p2","shell_pid":67,"foreground_process_group_id":67}}}\n' > "$resp/7.out"
+  printf '{"result":{"type":"pane_process_info","process_info":{"pane_id":"w1:p2","shell_pid":67,"foreground_process_group_id":67}}}\n' > "$resp/8.out"
+  make_refusal_ps_stub "$dir"
+  fb=$(make_herdr_fakebin "$dir")
+  out=$(PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" FM_HERDR_PS_BIN="$dir/ps" FM_BACKEND_HERDR_IDLE_SHELL_PROOF_POLLS=1 \
+    bash -c '. "$0/bin/backends/herdr.sh"; printf "%s\t%s\n" "$(fm_backend_herdr_pane_agent_state fmtest w1:p2)" "$(fm_backend_herdr_agent_state fmtest:w1:p2)"' "$ROOT")
+  [ "$out" = $'unknown\tunreadable' ] || fail "an unreadable process proof should refuse recovery, got: $out"
+  shell_log_count=$(grep -c $'pane\x1fprocess-info' "$log")
+  [ "$shell_log_count" -eq 4 ] || fail "the unreadable proof should be retried and then refused on both classifications, got $shell_log_count process-info reads"
+  pass "herdr recovery: unreadable process evidence refuses rather than being treated as stopped"
 }
 
 # --- composer_state: structural border-row classification --------------------
@@ -4513,6 +4638,7 @@ test_create_task_refuses_duplicate_label_when_agent_live
 test_create_task_refuses_when_any_duplicate_label_is_live
 test_create_task_closes_and_replaces_dead_pane_husk
 test_create_task_closes_and_replaces_no_agent_husk
+test_create_task_closes_and_replaces_done_shell_husk
 test_create_task_closes_all_duplicate_husks_after_replacement
 test_create_task_refuses_when_preexisting_husk_tab_remains
 test_create_task_refuses_when_agent_state_ambiguous
@@ -4590,6 +4716,10 @@ test_current_path_reads_cwd
 test_busy_state_working_maps_to_busy
 test_busy_state_done_and_blocked_map_to_idle
 test_busy_state_unknown_on_no_agent
+test_pane_agent_state_done_lone_idle_shell_becomes_no_agent
+test_pane_agent_state_done_real_pi_foreground_remains_live
+test_pane_agent_state_idle_non_shell_foreground_remains_live
+test_pane_agent_state_unreadable_process_proof_refuses
 test_composer_state_bare_prompt_is_empty
 test_composer_state_styled_placeholder_draft_is_pending
 test_composer_state_real_text_is_pending

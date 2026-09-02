@@ -9,9 +9,12 @@
 # an agent is running, and therefore whether a lifecycle verb may act at all,
 # comes from herdr's own agent registry.
 #
-# No real agent is launched. herdr's `pane report-agent` is the same registry
-# the adapter reads, so registering and not registering an agent on a plain
-# shell pane exercises exactly the classification the control plane gates on.
+# The first case starts with a stale idle/done registration on a lone shell:
+# exit must say already-stopped, relaunch must resurrect the same pane/worktree,
+# and interrupt on the relaunched agent must still work.
+# The second case keeps an idle registration on a pane running a non-shell
+# foreground command, so exit must refuse rather than pretending the agent
+# stopped.
 #
 # Always runs on a private, named, throwaway lab session, never the default
 # one (tests/herdr-test-safety.sh; the 2026-07-02 incident). Skips cleanly
@@ -38,7 +41,7 @@ cleanup_all() {
   herdr_safe_stop_and_delete "$SESSION"
 }
 trap cleanup_all EXIT
-fm_herdr_lab_prepare "$SESSION" || fail "could not prepare isolated Herdr lab session"
+fm_herdr_lab_provision "$SESSION" || fail "could not provision isolated Herdr lab session"
 
 SCRATCH=$(mktemp -d "${TMPDIR:-/tmp}/fm-control-herdr.XXXXXX")
 SCRATCH=$(cd "$SCRATCH" && pwd)
@@ -55,6 +58,8 @@ printf '# proj\n' > "$PROJ/README.md"
 git -C "$PROJ" add README.md
 git -C "$PROJ" -c user.name='Firstmate Tests' -c user.email='tests@example.invalid' commit -qm initial
 git -C "$PROJ" worktree add --quiet -b hsmoke "$WT"
+WT2="$SCRATCH/wt2"
+git -C "$PROJ" worktree add --quiet -b hsmoke-live "$WT2"
 
 # shellcheck source=/dev/null
 . "$ROOT/bin/fm-backend.sh"
@@ -91,59 +96,82 @@ EOF
 
 run_control() {
   env FM_HOME="$HOME_DIR" HERDR_SESSION="$SESSION" \
-    FM_CONTROL_POLL=0.2 FM_CONTROL_EXIT_WAIT=2 \
+    FM_CONTROL_POLL=0.2 FM_CONTROL_EXIT_WAIT=2 FM_CONTROL_LAUNCH_WAIT=10 FM_BACKEND_HERDR_IDLE_SHELL_PROOF_POLLS=30 \
     "$ROOT/bin/fm-control.sh" "$@" 2>&1
 }
 
-# --- no registered agent: the endpoint exists but hosts no agent ------------
-
-OUT=$(run_control hsmoke exit) || fail "exit against an agent-free herdr pane should be idempotent success: $OUT"
-case "$OUT" in
-  "already-stopped hsmoke"*) : ;;
-  *) fail "an agent-free herdr pane should report already-stopped, got: $OUT" ;;
-esac
-pass "real herdr: exit on a pane with no registered agent is idempotent success"
-
-if OUT=$(run_control hsmoke interrupt 2>&1); then
-  fail "interrupt should refuse when herdr reports no agent on the pane: $OUT"
-fi
-case "$OUT" in
-  *"nothing to interrupt"*) : ;;
-  *) fail "the interrupt refusal should say there is no agent, got: $OUT" ;;
-esac
-pass "real herdr: interrupt refuses when herdr's own agent registry reports no agent"
-
-# --- a registered agent: classification flips, and the verbs follow ---------
+# --- stale settled registration on a lone shell: exit is already-stopped, and
+# relaunch reuses the same pane/worktree -------------------------------------
 
 herdr pane report-agent "$PANE_ID" --source fm-control-smoke --agent fm-control-smoke-agent \
   --state idle --session "$SESSION" >/dev/null 2>&1 \
-  || fail "could not register a live agent on the task pane"
+  || fail "could not register a stale agent on the task pane"
+sleep 1
 
-STATE=$(fm_backend_agent_state herdr "$SESSION:$PANE_ID")
-[ "$STATE" = alive ] || fail "herdr should classify a registered agent as alive, got '$STATE'"
-
-OUT=$(run_control hsmoke interrupt) || fail "interrupt against a registered agent should succeed: $OUT"
+OUT=$(run_control hsmoke exit) || fail "exit against a stale-shell herdr pane should be idempotent success: $OUT"
 case "$OUT" in
-  *"interrupt-delivered hsmoke harness=claude backend=herdr verified=agent-alive cancel=unconfirmed"*) : ;;
-  *) fail "interrupt should report the agent-alive proof on herdr, got: $OUT" ;;
+  "already-stopped hsmoke"*) : ;;
+  *) fail "a stale-shell herdr pane should report already-stopped, got: $OUT" ;;
 esac
-pass "real herdr: interrupt delivers the harness's key and proves the agent survived it"
+pass "real herdr: exit on a stale idle registration over a lone shell is already-stopped"
+
+OUT=$(run_control hsmoke relaunch --note "stale shell recovered in place") \
+  || fail "relaunch against the stale shell should succeed in place: $OUT"
+case "$OUT" in
+  *"relaunched hsmoke harness=claude"*"backend=herdr"*"endpoint=$SESSION:$PANE_ID"*"worktree=$WT"*) : ;;
+  *) fail "relaunch should reuse the same pane and worktree, got: $OUT" ;;
+esac
+STATE=$(fm_backend_agent_state herdr "$SESSION:$PANE_ID")
+[ "$STATE" = alive ] || fail "the relaunched pane should be classified alive, got '$STATE'"
 
 herdr pane get "$PANE_ID" --session "$SESSION" >/dev/null 2>&1 \
   || fail "the control plane must never remove the endpoint it was operating on"
 [ -d "$WT" ] || fail "the control plane must never remove the task's local copy"
-pass "real herdr: no control verb removed the endpoint or the task's local copy"
+pass "real herdr: relaunch reuses the same pane and worktree, and the endpoint/local copy remain"
 
-# Last, because it deliberately types a harness command into a pane that hosts
-# a plain shell: the registered agent cannot actually be stopped that way, and
-# the control plane must say so rather than report a stop it did not achieve.
-if OUT=$(run_control hsmoke exit 2>&1); then
-  fail "exit should fail closed when the agent does not stop: $OUT"
+# --- a live non-shell foreground process still refuses exit ------------------
+
+TASK2_IDS=$(fm_backend_herdr_create_task "$CONTAINER" "fm-hsmoke-live" "$WT2") \
+  || fail "create_task for the non-shell refusal case failed"
+read -r TAB2_ID PANE2_ID <<EOF
+$TASK2_IDS
+EOF
+[ -n "$TAB2_ID" ] && [ -n "$PANE2_ID" ] || fail "the non-shell refusal task did not return tab/pane ids"
+
+{
+  echo "window=$SESSION:$PANE2_ID"
+  echo "endpoint_task_id=hsmoke-live"
+  echo "worktree=$WT2"
+  echo "project=$PROJ"
+  echo "harness=claude"
+  echo "kind=ship"
+  echo "mode=no-mistakes"
+  echo "yolo=off"
+  echo "model=default"
+  echo "effort=default"
+  echo "backend=herdr"
+  echo "herdr_session=$SESSION"
+  echo "herdr_workspace_id=$WORKSPACE_ID"
+  echo "herdr_tab_id=$TAB2_ID"
+  echo "herdr_pane_id=$PANE2_ID"
+} > "$HOME_DIR/state/hsmoke-live.meta"
+
+herdr pane report-agent "$PANE2_ID" --source fm-control-smoke --agent fm-control-smoke-agent \
+  --state idle --session "$SESSION" >/dev/null 2>&1 \
+  || fail "could not register the live non-shell refusal agent"
+sleep 1
+
+OUT=$(fm_backend_herdr_send_text_line "$SESSION:$PANE2_ID" "sleep 60") \
+  || fail "could not start the non-shell foreground process"
+sleep 0.5
+STATE=$(fm_backend_agent_state herdr "$SESSION:$PANE2_ID")
+[ "$STATE" = alive ] || fail "the non-shell foreground process should stay alive, got '$STATE'"
+
+if OUT=$(run_control hsmoke-live exit 2>&1); then
+  fail "exit should fail closed when the non-shell foreground process does not stop: $OUT"
 fi
 case "$OUT" in
   *"did not stop"*) : ;;
-  *) fail "the exit failure should say the agent did not stop, got: $OUT" ;;
+  *) fail "the non-shell exit failure should say the agent did not stop, got: $OUT" ;;
 esac
-pass "real herdr: an agent that does not stop fails closed instead of being reported as stopped"
-
-fm_backend_herdr_kill "$SESSION:$PANE_ID" 2>/dev/null || true
+pass "real herdr: a live non-shell foreground process stays live and refuses exit"
