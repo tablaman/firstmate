@@ -635,24 +635,28 @@ Polling remained active and is covered as the fallback for capability, connect, 
 
 ### Agent lifecycle control
 
-Herdr is one of the two backends whose recovery-grade agent-state classifier the control plane may trust ([agent-control.md](../agent-control.md)), so its lifecycle gating is measured against the real binary; reverified 2026-08-08 on Herdr 0.8.0, and first measured 2026-08-02 on Herdr 0.7.5 with identical results:
+Herdr is one of the two backends whose recovery-grade agent-state classifier the control plane may trust ([agent-control.md](../agent-control.md)), so its lifecycle gating is measured against the real binary:
 
 ```sh
 tests/fm-control-herdr-smoke.test.sh
 ```
 
-Observed output:
+The test's first case begins with no registered agent, then plants a stale idle/done registration over a lone shell: interrupt must refuse, exit must report already-stopped, relaunch must resurrect the same pane and worktree, and interrupt on the relaunched real agent must deliver with the agent-alive proof.
+The second case keeps an idle registration over a non-shell foreground command, so exit must refuse rather than pretending the agent stopped.
+The registry read through `herdr pane report-agent` is the same source `fm_backend_herdr_agent_state` classifies, so these cases exercise exactly the gate every lifecycle verb depends on.
+The lone-shell legs require the pane's interactive shell to come up bare; an operator shell shim that wraps the pane shell defeats the strict lone-idle-shell proof, and the proof's refusal there is correct behavior, not a test defect.
+
+On 2026-09-03 with Herdr 0.8.0 the idle-shell recovery legs passed against the real binary:
 
 ```text
-ok - real herdr: exit on a pane with no registered agent is idempotent success
 ok - real herdr: interrupt refuses when herdr's own agent registry reports no agent
-ok - real herdr: interrupt delivers the harness's key and proves the agent survived it
-ok - real herdr: no control verb removed the endpoint or the task's local copy
-ok - real herdr: an agent that does not stop fails closed instead of being reported as stopped
+ok - real herdr: exit on a stale idle registration over a lone shell is already-stopped
+ok - real herdr: relaunch reuses the same pane and worktree, and the endpoint/local copy remain
 ```
 
-The registry read through `herdr pane report-agent` is the same source `fm_backend_herdr_agent_state` classifies, so registering and not registering an agent on a plain shell pane exercises exactly the gate every lifecycle verb depends on, with no real agent launched.
-That command is the guard that refreshes this record; run it after every Herdr upgrade rather than trusting the version above.
+The relaunched-agent interrupt-survival leg launches and holds a real agent, which the sandboxed run that produced the record above could not sustain; it last fully passed under the pre-rewrite test revision reverified 2026-08-08 on Herdr 0.8.0 (first measured 2026-08-02 on Herdr 0.7.5).
+The non-shell foreground exit-refusal leg runs after that leg in the same script, so it is pinned hermetically in `tests/fm-backend-herdr.test.sh` pending its first real-binary pass.
+That command is the guard that refreshes this record; run the full test after every Herdr upgrade rather than trusting the versions above.
 
 ### Away-mode transport
 
