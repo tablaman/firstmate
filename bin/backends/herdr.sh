@@ -103,8 +103,8 @@ FM_BACKEND_HERDR_MIN_WORKSPACE_MOVE_PROTOCOL=16
 # The version floor for DEFAULT-ON presentation projection. Projection turns
 # every crewmate teardown into a workspace-emptying removal, and the focus-safe
 # removal plan can only avoid Herdr's focus-stealing explicit close while the
-# doomed pane holds a provably lone idle childless shell; a persistent child of
-# that shell (gitstatusd, a zsh-async worker, direnv) makes the plan fall back
+# doomed pane holds a provably idle linear shell chain; a persistent non-shell
+# child of any chain shell (gitstatusd, a zsh-async worker, direnv) makes the plan fall back
 # to the plain explicit close, which steals focus on every release without the
 # two upstream focus fixes (PR #1877 commit 165dca45, PR #1912 commit a979916).
 # Herdr 0.8.0 is the first release carrying both, so a home that configured
@@ -832,8 +832,8 @@ fm_backend_herdr_projection_focus_restore() {  # <session> <snapshot> <operation
 # When the close would empty the target workspace, Herdr 0.7.5's explicit
 # close moves focus to the workspace's neighbor, so the close is planned by
 # fm_backend_herdr_emptying_close_plan: reposition the doomed workspace
-# behind the focused one when needed, then end the pane's verified lone idle
-# shell so Herdr removes the emptied workspace through its focus-preserving
+# behind the focused one when needed, then end the pane's verified idle shell
+# chain root so Herdr removes the emptied workspace through its focus-preserving
 # pane-death path. The exact-tab restore below remains the backstop, and any
 # ambiguity falls back to the plain explicit close, which the backstop masks
 # exactly as before this hardening.
@@ -935,9 +935,9 @@ fm_backend_herdr_projection_close_pane_focus_preserving() {  # <session> <pane-i
 # other workspace's relative order, so no presentation ordering change
 # persists.
 # That reasoning covers the pane-death route only. The plan's plain-close
-# FALLBACK is reachable exactly when the doomed pane's shell cannot be proved
-# lone, childless, and idle - a persistent gitstatusd, zsh-async worker, or
-# direnv fails that proof permanently - and on a release without both fixes the
+# FALLBACK is reachable exactly when the doomed pane cannot be proved to hold
+# a single idle linear shell chain - a persistent gitstatusd, zsh-async worker,
+# or direnv fails that proof permanently - and on a release without both fixes the
 # fallback is the focus-stealing close itself, so the mitigation is conditional
 # rather than unconditional and a version gate IS required. Default-on
 # projection is therefore floored at FM_BACKEND_HERDR_MIN_PRESENTATION_VERSION,
@@ -992,7 +992,7 @@ fm_backend_herdr_workspace_move_capable() {  # <session>
 # and one pane, both the target), the target workspace to sit behind the
 # focused one (repositioned to the end first when it does not, with the move
 # verified against the server-returned order and focus), and the exact pane
-# to hold one provably lone idle recognized shell.
+# to hold one provably idle recognized shell chain.
 fm_backend_herdr_emptying_close_plan() {  # <session> <pane-id> <workspace-id> <tab-id> <focused-workspace-id>
   local session=$1 pane_id=$2 ws_id=$3 tab_id=$4 focused_ws=$5
   local tabs panes list indices r rest a len capable socket mover response move_status shell_pid before_order
@@ -1118,13 +1118,13 @@ FMEOF
   fi
 }
 
-# fm_backend_herdr_death_close_pane: end the exact pane's proved lone idle
-# shell so Herdr removes the emptied workspace through its focus-preserving
+# fm_backend_herdr_death_close_pane: end the exact pane's proved idle shell
+# chain root so Herdr removes the emptied workspace through its focus-preserving
 # pane-death path, then confirm the pane is gone.
 # Each signal is sent only while the exact pane still owns the recorded pid
 # as the chain root: SIGHUP relies on the proof taken just before, and
 # the SIGKILL escalation re-reads the pane's process information and refuses
-# unless the same pid is still the pane's strict bare idle shell, so an
+# unless the same pid is still the proven idle chain's root shell, so an
 # exited or reused pid is never signaled.
 # Returns 0 only when the pane is confirmed gone.
 fm_backend_herdr_death_close_pane() {  # <session> <pane-id> <shell-pid>
