@@ -16,7 +16,7 @@
 #
 # Always runs on a private, named, throwaway lab session, never the default
 # one (tests/herdr-test-safety.sh; the 2026-07-02 incident). Skips cleanly
-# when herdr, jq, or claude is missing.
+# when herdr, Treehouse, jq, or claude is missing.
 set -u
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -25,6 +25,7 @@ fail() { printf 'not ok - %s\n' "$1" >&2; cleanup_all; exit 1; }
 pass() { printf 'ok - %s\n' "$1"; }
 
 command -v herdr >/dev/null 2>&1 || { echo "skip: herdr not found"; exit 0; }
+command -v treehouse >/dev/null 2>&1 || { echo "skip: treehouse not found"; exit 0; }
 command -v jq >/dev/null 2>&1 || { echo "skip: jq not found (required by the herdr adapter)"; exit 0; }
 command -v claude >/dev/null 2>&1 || { echo "skip: claude not found"; exit 0; }
 
@@ -205,11 +206,12 @@ pass "real herdr: interrupt delivers the harness's key to the relaunched agent a
 
 # --- a nested idle shell chain recovers as a settled husk --------------------
 
-# The treehouse/worktree shape: the pane's own shell hosts a child shell in
-# the same worktree, both idle. A stale settled registration over that
-# nested chain must collapse to already-stopped exactly like the lone-shell
-# case - this is the linear-chain acceptance the hermetic suite pins,
-# observed here against the real binary.
+# The real Treehouse worktree shape: the pane's own shell hosts a sleeping
+# `treehouse get` wrapper whose one child is the idle pooled-worktree shell.
+# A stale settled registration over that nested chain must collapse to
+# already-stopped exactly like the lone-shell case - this is the narrow
+# wrapper acceptance the hermetic suite pins, observed here against both real
+# Treehouse and Herdr binaries.
 TASK3_IDS=$(fm_backend_herdr_create_task "$CONTAINER" "fm-hsmoke-nest" "$WT3") \
   || fail "create_task for the nested-chain recovery case failed"
 read -r TAB3_ID PANE3_ID <<EOF
@@ -235,9 +237,34 @@ EOF
   echo "herdr_pane_id=$PANE3_ID"
 } > "$HOME_DIR/state/hsmoke-nest.meta"
 
-OUT=$(fm_backend_herdr_send_text_line "$SESSION:$PANE3_ID" "zsh") \
-  || fail "could not start the nested child shell"
+OUT=$(fm_backend_herdr_send_text_line "$SESSION:$PANE3_ID" "treehouse get") \
+  || fail "could not start the Treehouse worktree shell"
 sleep 2
+
+INFO=
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  INFO=$(herdr pane process-info --pane "$PANE3_ID" --session "$SESSION" 2>/dev/null) || INFO=
+  SHELL3_PID=$(printf '%s' "$INFO" | jq -r '.result.process_info.shell_pid // empty' 2>/dev/null)
+  FG3_PID=$(printf '%s' "$INFO" | jq -r '
+    .result.process_info.foreground_processes
+    | select(type == "array" and length == 1)
+    | .[0].pid // empty
+  ' 2>/dev/null)
+  [ -n "$SHELL3_PID" ] && [ -n "$FG3_PID" ] && break
+  sleep 0.5
+done
+[ -n "$SHELL3_PID" ] && [ -n "$FG3_PID" ] \
+  || fail "the Treehouse worktree shell did not expose one stable foreground process: $INFO"
+TREEHOUSE3_PID=$(ps -p "$FG3_PID" -o ppid= 2>/dev/null | tr -d '[:space:]')
+TREEHOUSE3_PARENT=$(ps -p "$TREEHOUSE3_PID" -o ppid= 2>/dev/null | tr -d '[:space:]')
+TREEHOUSE3_COMM=$(ps -p "$TREEHOUSE3_PID" -o comm= 2>/dev/null | tr -d '[:space:]')
+TREEHOUSE3_COMM=${TREEHOUSE3_COMM##*/}
+TREEHOUSE3_ARGS=$(ps -p "$TREEHOUSE3_PID" -o args= 2>/dev/null)
+if ! { [ "$TREEHOUSE3_PARENT" = "$SHELL3_PID" ] \
+  && [ "$TREEHOUSE3_COMM" = treehouse ] \
+  && printf '%s\n' "$TREEHOUSE3_ARGS" | awk 'NF == 2 { command = $1; sub(/^.*\//, "", command); exit !(command == "treehouse" && $2 == "get") } { exit 1 }'; }; then
+  fail "the nested recovery leg did not create pane-shell -> treehouse-get -> foreground-shell: $INFO"
+fi
 
 herdr pane report-agent "$PANE3_ID" --source fm-control-smoke --agent fm-control-smoke-agent \
   --state idle --session "$SESSION" >/dev/null 2>&1 \
@@ -252,7 +279,7 @@ case "$OUT" in
 esac
 STATE=$(fm_backend_agent_state herdr "$SESSION:$PANE3_ID")
 [ "$STATE" = dead ] || fail "the nested idle shell chain should classify dead, got '$STATE'"
-pass "real herdr: a stale idle registration over a nested shell chain recovers as already-stopped"
+pass "real herdr: a stale idle registration over a treehouse-get shell chain recovers as already-stopped"
 
 # --- a live non-shell foreground process still refuses exit ------------------
 

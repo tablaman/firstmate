@@ -1575,6 +1575,26 @@ SH
   : > "$dir/mover.log"
 }
 
+# make_treehouse_death_lab <dir> <shell-pid> <treehouse-pid>
+# <foreground-shell-pid> [<treehouse-args>]: model the real pooled-worktree
+# process chain: pane shell -> `treehouse get` -> foreground shell.
+make_treehouse_death_lab() {
+  local dir=$1 shell_pid=$2 treehouse_pid=$3 foreground_pid=$4 treehouse_args=${5:-treehouse get}
+  mkdir -p "$dir"
+  cat > "$dir/ps" <<SH
+#!/usr/bin/env bash
+case "\$*" in
+  "-axo pid=,ppid=") printf '1 0\n$shell_pid 1\n$treehouse_pid $shell_pid\n$foreground_pid $treehouse_pid\n' ;;
+  "-p $shell_pid -o stat="|"-p $treehouse_pid -o stat="|"-p $foreground_pid -o stat=") printf 'S\n' ;;
+  "-p $shell_pid -o comm="|"-p $foreground_pid -o comm=") printf -- '-zsh\n' ;;
+  "-p $treehouse_pid -o comm=") printf 'treehouse\n' ;;
+  "-p $treehouse_pid -o args=") printf '%s\n' '$treehouse_args' ;;
+  *) exit 1 ;;
+esac
+SH
+  chmod +x "$dir/ps"
+}
+
 make_refusal_ps_stub() {  # <dir> -> echoes a ps stub that never confirms the proof
   local dir=$1
   cat > "$dir/ps" <<'SH'
@@ -3166,6 +3186,49 @@ test_pane_agent_state_done_nested_shell_chain_collapses() {
   shell_log_count=$(grep -c $'pane\x1fprocess-info' "$log")
   [ "$shell_log_count" -eq 2 ] || fail "the nested-shell proof should use one process-info read per classification call, got $shell_log_count"
   pass "herdr recovery: a done registration on a nested shell chain becomes no-agent/dead"
+}
+
+# Treehouse's interactive `get` keeps one sleeping wrapper between the pane
+# shell and the pooled-worktree shell. This is the real chain the recovery must
+# accept, not merely a direct shell child described as Treehouse-shaped.
+test_pane_agent_state_done_treehouse_get_chain_collapses() {
+  local dir log resp fb out shell_log_count root_pid=84605 treehouse_pid=85390 leaf_pid=85430
+  dir="$TMP_ROOT/pane-state-done-treehouse-chain"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
+  printf '{"result":{"pane":{"pane_id":"w1:p2"}}}\n' > "$resp/1.out"
+  printf '{"result":{"agent":{"agent_status":"done"}}}\n' > "$resp/2.out"
+  process_info_fixture w1:p2 "$root_pid" "$leaf_pid" zsh zsh > "$resp/3.out"
+  printf '{"result":{"pane":{"pane_id":"w1:p2"}}}\n' > "$resp/4.out"
+  printf '{"result":{"agent":{"agent_status":"done"}}}\n' > "$resp/5.out"
+  process_info_fixture w1:p2 "$root_pid" "$leaf_pid" zsh zsh > "$resp/6.out"
+  make_treehouse_death_lab "$dir" "$root_pid" "$treehouse_pid" "$leaf_pid"
+  fb=$(make_herdr_fakebin "$dir")
+  out=$(PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" FM_HERDR_PS_BIN="$dir/ps" FM_BACKEND_HERDR_IDLE_SHELL_PROOF_POLLS=1 \
+    bash -c '. "$0/bin/backends/herdr.sh"; printf "%s\t%s\n" "$(fm_backend_herdr_pane_agent_state fmtest w1:p2)" "$(fm_backend_herdr_agent_state fmtest:w1:p2)"' "$ROOT")
+  [ "$out" = $'no-agent\tdead' ] || fail "settled done+treehouse-get shell chain should collapse to no-agent/dead, got: $out"
+  shell_log_count=$(grep -c $'pane\x1fprocess-info' "$log")
+  [ "$shell_log_count" -eq 2 ] || fail "the treehouse-get proof should use one process-info read per classification call, got $shell_log_count"
+  pass "herdr recovery: a done registration on a treehouse-get shell chain becomes no-agent/dead"
+}
+
+# A Treehouse process is not generically safe. Only the exact interactive
+# `treehouse get` wrapper is admitted; every other subcommand remains live.
+test_pane_agent_state_done_other_treehouse_command_remains_live() {
+  local dir log resp fb out root_pid=84605 treehouse_pid=85390 leaf_pid=85430
+  dir="$TMP_ROOT/pane-state-done-treehouse-other"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
+  printf '{"result":{"pane":{"pane_id":"w1:p2"}}}\n' > "$resp/1.out"
+  printf '{"result":{"agent":{"agent_status":"done"}}}\n' > "$resp/2.out"
+  process_info_fixture w1:p2 "$root_pid" "$leaf_pid" zsh zsh > "$resp/3.out"
+  process_info_fixture w1:p2 "$root_pid" "$leaf_pid" zsh zsh > "$resp/4.out"
+  printf '{"result":{"pane":{"pane_id":"w1:p2"}}}\n' > "$resp/5.out"
+  printf '{"result":{"agent":{"agent_status":"done"}}}\n' > "$resp/6.out"
+  process_info_fixture w1:p2 "$root_pid" "$leaf_pid" zsh zsh > "$resp/7.out"
+  process_info_fixture w1:p2 "$root_pid" "$leaf_pid" zsh zsh > "$resp/8.out"
+  make_treehouse_death_lab "$dir" "$root_pid" "$treehouse_pid" "$leaf_pid" "treehouse run"
+  fb=$(make_herdr_fakebin "$dir")
+  out=$(PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" FM_HERDR_PS_BIN="$dir/ps" FM_BACKEND_HERDR_IDLE_SHELL_PROOF_POLLS=1 \
+    bash -c '. "$0/bin/backends/herdr.sh"; printf "%s\t%s\n" "$(fm_backend_herdr_pane_agent_state fmtest w1:p2)" "$(fm_backend_herdr_agent_state fmtest:w1:p2)"' "$ROOT")
+  [ "$out" = $'live\talive' ] || fail "a non-get Treehouse command should stay live/alive, got: $out"
+  pass "herdr recovery: a non-get Treehouse wrapper stays live/alive"
 }
 
 # A branching shell tree is ambiguous and must stay live/unknown instead of
@@ -4858,6 +4921,8 @@ test_busy_state_unknown_on_no_agent
 test_pane_agent_state_done_lone_idle_shell_becomes_no_agent
 test_pane_idle_shell_pid_accepts_nested_linear_shell_chain
 test_pane_agent_state_done_nested_shell_chain_collapses
+test_pane_agent_state_done_treehouse_get_chain_collapses
+test_pane_agent_state_done_other_treehouse_command_remains_live
 test_pane_agent_state_done_branching_shell_chain_remains_live
 test_pane_agent_state_done_real_pi_foreground_remains_live
 test_pane_agent_state_idle_non_shell_foreground_remains_live

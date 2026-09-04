@@ -1175,12 +1175,35 @@ fm_backend_herdr_pid_is_bare_shell() {  # <ps-bin> <pid>
   return 1
 }
 
+# fm_backend_herdr_pid_is_treehouse_get: <pid> is the exact Treehouse wrapper
+# that opens one pooled-worktree subshell. The shell-chain proof separately
+# requires it to sleep with exactly one child and permits at most one wrapper,
+# so a different Treehouse command or a wrapper doing concurrent work refuses.
+fm_backend_herdr_pid_is_treehouse_get() {  # <ps-bin> <pid>
+  local comm args
+  comm=$("$1" -p "$2" -o comm= 2>/dev/null) || return 1
+  comm=$(printf '%s' "$comm" | tr -d '[:space:]')
+  comm=${comm#-}
+  comm=${comm##*/}
+  [ "$comm" = treehouse ] || return 1
+  args=$("$1" -p "$2" -o args= 2>/dev/null) || return 1
+  printf '%s\n' "$args" | awk '
+    NF == 2 {
+      command = $1
+      sub(/^.*\//, "", command)
+      if (command == "treehouse" && $2 == "get") exit 0
+    }
+    { exit 1 }
+  '
+}
+
 # fm_backend_herdr_pane_idle_shell_pid: print the shell pid of <pane-id> only
 # when the exact pane provably holds one idle recognized shell chain: the
 # pane shell and the lone foreground shell are both recognized shells, the
-# foreground shell is the sole foreground process-group member, the operating-
-# system process table shows one linear shell chain from pane shell to
-# foreground shell with no branches or extra children, and every shell in
+# chain may contain one exact sleeping `treehouse get` wrapper between them,
+# the foreground shell is the sole foreground process-group member, the
+# operating-system process table shows one linear chain from pane shell to
+# foreground shell with no branches or extra children, and every member in
 # that chain sits in a sleeping or idle state.
 # An idle interactive shell transiently hosts short-lived prompt helpers
 # (verified on the real 0.7.5 lab: a workspace.move relayout makes zsh redraw
@@ -1217,7 +1240,7 @@ fm_backend_herdr_pane_idle_shell_pid() {  # <session> <pane-id>
 # and stays retryable.
 fm_backend_herdr_pane_idle_shell_sample() {  # <session> <pane-id>
   local session=$1 pane=$2 info shell_pid foreground_pgid count
-  local foreground_pid name argv0 shell_name rows stat ps_bin current parent child_count hops max_hops
+  local foreground_pid name argv0 shell_name rows stat ps_bin current parent child_count hops max_hops treehouse_get_count=0
   info=$(fm_backend_herdr_cli "$session" pane process-info --pane "$pane" 2>/dev/null) || return 1
   printf '%s' "$info" | jq -e --arg pane "$pane" '
     .result.type == "pane_process_info"
@@ -1262,7 +1285,11 @@ fm_backend_herdr_pane_idle_shell_sample() {  # <session> <pane-id>
   while :; do
     hops=$((hops + 1))
     [ "$hops" -le "$max_hops" ] || return 1
-    fm_backend_herdr_pid_is_bare_shell "$ps_bin" "$current" || return 1
+    if ! fm_backend_herdr_pid_is_bare_shell "$ps_bin" "$current"; then
+      fm_backend_herdr_pid_is_treehouse_get "$ps_bin" "$current" || return 1
+      treehouse_get_count=$((treehouse_get_count + 1))
+      [ "$treehouse_get_count" -le 1 ] || return 1
+    fi
     stat=$("$ps_bin" -p "$current" -o stat= 2>/dev/null | tr -d '[:space:]') || return 1
     case "$stat" in S*|I*) ;; *) return 1 ;; esac
     child_count=$(printf '%s\n' "$rows" | awk -v pid="$current" '$2 == pid { count++ } END { print count + 0 }') || return 1
