@@ -1,0 +1,12 @@
+# tests/fm-backend-herdr.test.sh (hermetic, 194 tests, exit 0) - recovery-classification pins:
+ok - herdr recovery: a done registration on a nested shell chain becomes no-agent/dead
+ok - herdr recovery: a done registration on a treehouse-get shell chain becomes no-agent/dead
+ok - herdr recovery: a done registration on one lone idle shell becomes no-agent/dead
+ok - herdr recovery: a live pi foreground classifies live on the first proof sample without burning the settle budget
+ok - herdr recovery: a nested idle shell chain still yields the pane shell pid
+ok - herdr recovery: a non-get Treehouse wrapper stays live/alive
+ok - herdr recovery: a non-shell foreground process remains live/alive
+ok - herdr recovery: a settled Pi foreground process remains live/alive
+ok - herdr recovery: a transient prompt-helper sample still settles to the proven idle shell
+ok - herdr recovery: branching shell chains stay live/alive rather than being mistaken for husks
+ok - herdr recovery: unreadable process evidence refuses rather than being treated as stopped
