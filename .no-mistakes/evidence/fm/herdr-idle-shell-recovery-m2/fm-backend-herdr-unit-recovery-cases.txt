@@ -1,0 +1,18 @@
+# tests/fm-backend-herdr.test.sh — full portable regression, exit 0, 194 ok, 0 failures
+# New idle-shell-chain recovery cases:
+ok - fm_backend_herdr_create_task: closes and replaces a same-labeled tab whose settled done agent collapses to a lone idle shell husk
+ok - herdr recovery: a done registration on one lone idle shell becomes no-agent/dead
+ok - herdr recovery: a nested idle shell chain still yields the pane shell pid
+ok - herdr recovery: a done registration on a nested shell chain becomes no-agent/dead
+ok - herdr recovery: a done registration on a treehouse-get shell chain becomes no-agent/dead
+ok - herdr recovery: a non-get Treehouse wrapper stays live/alive
+ok - herdr recovery: branching shell chains stay live/alive rather than being mistaken for husks
+ok - herdr recovery: a settled Pi foreground process remains live/alive
+ok - herdr recovery: a non-shell foreground process remains live/alive
+ok - herdr recovery: a live pi foreground classifies live on the first proof sample without burning the settle budget
+ok - herdr recovery: a transient prompt-helper sample still settles to the proven idle shell
+ok - herdr recovery: unreadable process evidence refuses rather than being treated as stopped
+ok - fm_backend_herdr_wait_for_working: reports 'busy' immediately on the first poll, without spending the rest of the budget
+ok - fm_backend_herdr_wait_for_working: spreads six samples across the full budget endpoint without a final trailing sleep
+ok - fm_backend_herdr_send_text_submit: applies the herdr minimum confirmation budget before polling agent-state
+ok - fm_backend_herdr_send_text_submit: a slow transition landing on a later sample within one Enter's budget is confirmed WITHOUT sending a needless extra Enter
