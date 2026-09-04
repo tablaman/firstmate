@@ -831,6 +831,17 @@ assert_no_ordering_lifecycle_calls_since "$FAIL_START" "failed presentation orde
 pass "real Herdr lab: forced workspace.move failure leaves a successful worker in default order with a warning and no cleanup"
 
 mkdir -p "$POST_CREATE_ABORT_CONTROL"
+# The serialization audit below observes cleanup only through the wrapper's
+# `pane close` CLI calls. A pane whose shell proves an idle shell chain would
+# route the abort cleanup down the focus-preserving pane-death path (a direct
+# signal the wrapper cannot see), and whether the doomed task pane's shell
+# proves varies by platform and Herdr release. Pin the process proof to its
+# documented
+# unreadable-evidence refusal so cleanup deterministically falls back to the
+# plain audited close everywhere; the pane-death route itself is covered by
+# the portable close-plan regressions in tests/fm-backend-herdr.test.sh.
+export FM_HERDR_PS_BIN="$TMP_ROOT/no-such-ps"
+export FM_BACKEND_HERDR_IDLE_SHELL_PROOF_POLLS=1
 ABORT_START=$(log_line_count)
 ABORT_FOCUS_START=$(focus_audit_line_count)
 spawn_task abort-a "$HOME_DIR" "$PROJECT_DIR" > "$TMP_ROOT/abort-a.out" 2> "$TMP_ROOT/abort-a.err" &
@@ -875,6 +886,7 @@ done
   || fail "post-create abort fixtures published task metadata before launch"
 rm -rf "$POST_CREATE_ABORT_CONTROL"
 rm -f "$HOME_DIR/state/abort-a.herdr-presentation" "$HOME_DIR/state/abort-b.herdr-presentation"
+unset FM_HERDR_PS_BIN FM_BACKEND_HERDR_IDLE_SHELL_PROOF_POLLS
 pass "real Herdr lab: concurrent post-create abort cleanup stays serialized with exact focus restoration"
 
 SHAPE_CLEANUP_AUDIT_START=$(focus_audit_line_count)
