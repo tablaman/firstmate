@@ -160,12 +160,25 @@ pass "fixed: the workspace holds exactly the 2 replacement tabs after both respa
 
 # --- 4. a GENUINELY live duplicate still refuses, unchanged -----------------
 # Register a real agent (herdr's own native registration primitive) on one of
-# the freshly-respawned panes, then confirm a further same-labeled spawn
-# attempt refuses exactly as before - the husk fix must never touch a pane
-# that actually has something registered in it.
+# the freshly-respawned panes and put real non-shell foreground work in it,
+# then confirm a further same-labeled spawn attempt refuses exactly as before
+# - the husk fix must never touch a pane that actually has something running
+# in it. A bare registration over a lone idle shell no longer models "live":
+# the idle-shell-chain recovery deliberately treats that as a settled husk.
 
 herdr pane report-agent "$NEW_CREW_PANE_ID" --source fm-respawn-e2e --agent fm-respawn-live-agent --state idle --session "$SESSION" >/dev/null 2>&1 \
   || fail "could not register a live agent on the respawned crewmate-shaped pane"
+LIVE_STATE=
+for _ in 1 2 3 4 5; do
+  fm_backend_herdr_send_text_line "$SESSION:$NEW_CREW_PANE_ID" 'exec sleep 300' || true
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    LIVE_STATE=$(fm_backend_herdr_pane_agent_state "$SESSION" "$NEW_CREW_PANE_ID")
+    [ "$LIVE_STATE" = live ] && break 2
+    sleep 0.2
+  done
+done
+[ "$LIVE_STATE" = live ] \
+  || fail "the live-duplicate pane never classified live over its non-shell foreground work (got '$LIVE_STATE')"
 
 if fm_backend_herdr_create_task "$CONTAINER" "$CREW_LABEL" "$PROJ_CWD" >/dev/null 2>&1; then
   fail "REGRESSION: create_task should refuse a same-labeled tab whose pane hosts a genuinely live registered agent"

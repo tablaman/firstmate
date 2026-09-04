@@ -1403,6 +1403,20 @@ lab workspace get "$DUP2_WSID" >/dev/null 2>&1 || fail "duplicate-token recovery
 
 lab pane report-agent "$DUP1_PANE" --source fm-projection-e2e --agent test-agent --state idle >/dev/null \
   || fail "could not register the duplicate-live-agent risk fixture"
+# An idle registration over a lone idle shell is deliberately recoverable
+# under the idle-shell-chain proof, so the live-risk fixture needs real
+# non-shell foreground work in the pane to model a genuinely live agent.
+DUP_LIVE_STATE=
+for _ in 1 2 3 4 5; do
+  lab pane run "$DUP1_PANE" 'exec sleep 300' >/dev/null 2>&1 || true
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    DUP_LIVE_STATE=$(fm_backend_herdr_pane_agent_state "$HERDR_LAB_SESSION" "$DUP1_PANE")
+    [ "$DUP_LIVE_STATE" = live ] && break 2
+    sleep 0.2
+  done
+done
+[ "$DUP_LIVE_STATE" = live ] \
+  || fail "the duplicate-live-agent risk pane never classified live over its non-shell foreground work (got '$DUP_LIVE_STATE')"
 START=$(log_line_count)
 if fm_backend_herdr_projection_recovery_allows_flat "$HERDR_LAB_SESSION" "$DUP_JOURNAL" duplicate1; then
   fail "a duplicate token match with a registered agent should refuse fallback"
