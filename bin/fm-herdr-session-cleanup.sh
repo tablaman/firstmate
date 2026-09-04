@@ -249,7 +249,7 @@ fm_herdr_cleanup_one() { # <session> <workspace> <title> <home-real>
   pane=$FM_HERDR_CLEANUP_PANE
   if [ "$(fm_backend_herdr_pane_agent_state "$session" "$pane")" != no-agent ] \
     || ! fm_backend_herdr_pane_idle_shell_pid "$session" "$pane" >/dev/null; then
-    fm_herdr_cleanup_warn "$id preserved because its pane is not a provably idle childless shell"
+    fm_herdr_cleanup_warn "$id preserved because its pane fails the strict idle-shell-chain proof"
     fm_lock_release "$presentation_lock" || true
     fm_lock_release "$task_lock" || true
     return 0
