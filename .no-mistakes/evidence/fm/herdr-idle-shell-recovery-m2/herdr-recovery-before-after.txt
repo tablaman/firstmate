@@ -1,0 +1,13 @@
+Manual fail-before/pass-after repro of the Herdr idle-shell recovery classifier
+(fm_backend_herdr_pane_agent_state), run with identical canned Herdr CLI
+responses (pane present, agent registry reports agent_status "idle") and an
+identical fake process table showing one lone sleeping zsh (pid 67, no children)
+- i.e. a stale settled registration over an idle shell:
+
+BASE   (77ee3c8, pre-fix)  stale idle registration over lone idle shell -> live
+TARGET (ffee3e3, fixed)    stale idle registration over lone idle shell -> no-agent
+
+"live" means every lifecycle verb refused recovery before the fix; "no-agent"
+is the conservative husk state that lets fm-control exit report already-stopped
+and relaunch resurrect the same pane/worktree, as demonstrated end-to-end by
+the real-binary smoke transcript (fm-control-herdr-smoke-transcript.txt).
