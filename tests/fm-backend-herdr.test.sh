@@ -3231,6 +3231,29 @@ test_pane_agent_state_done_other_treehouse_command_remains_live() {
   pass "herdr recovery: a non-get Treehouse wrapper stays live/alive"
 }
 
+# The one admitted `treehouse get` wrapper may only sit between the pane shell
+# and the foreground shell. A pane whose registered shell pid is itself the
+# sleeping wrapper has no recognized bare-shell chain root and must stay live
+# instead of classifying as a recoverable husk.
+test_pane_agent_state_done_treehouse_root_wrapper_remains_live() {
+  local dir log resp fb out root_pid=84605 treehouse_pid=85390 leaf_pid=85430
+  dir="$TMP_ROOT/pane-state-done-treehouse-root"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
+  printf '{"result":{"pane":{"pane_id":"w1:p2"}}}\n' > "$resp/1.out"
+  printf '{"result":{"agent":{"agent_status":"done"}}}\n' > "$resp/2.out"
+  process_info_fixture w1:p2 "$treehouse_pid" "$leaf_pid" zsh zsh > "$resp/3.out"
+  process_info_fixture w1:p2 "$treehouse_pid" "$leaf_pid" zsh zsh > "$resp/4.out"
+  printf '{"result":{"pane":{"pane_id":"w1:p2"}}}\n' > "$resp/5.out"
+  printf '{"result":{"agent":{"agent_status":"done"}}}\n' > "$resp/6.out"
+  process_info_fixture w1:p2 "$treehouse_pid" "$leaf_pid" zsh zsh > "$resp/7.out"
+  process_info_fixture w1:p2 "$treehouse_pid" "$leaf_pid" zsh zsh > "$resp/8.out"
+  make_treehouse_death_lab "$dir" "$root_pid" "$treehouse_pid" "$leaf_pid"
+  fb=$(make_herdr_fakebin "$dir")
+  out=$(PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" FM_HERDR_PS_BIN="$dir/ps" FM_BACKEND_HERDR_IDLE_SHELL_PROOF_POLLS=1 \
+    bash -c '. "$0/bin/backends/herdr.sh"; printf "%s\t%s\n" "$(fm_backend_herdr_pane_agent_state fmtest w1:p2)" "$(fm_backend_herdr_agent_state fmtest:w1:p2)"' "$ROOT")
+  [ "$out" = $'live\talive' ] || fail "a chain rooted at the treehouse-get wrapper should stay live/alive, got: $out"
+  pass "herdr recovery: a chain rooted at the treehouse-get wrapper stays live/alive"
+}
+
 # A branching shell tree is ambiguous and must stay live/unknown instead of
 # being mistaken for the recoverable nested-shell chain.
 test_pane_agent_state_done_branching_shell_chain_remains_live() {
@@ -4923,6 +4946,7 @@ test_pane_idle_shell_pid_accepts_nested_linear_shell_chain
 test_pane_agent_state_done_nested_shell_chain_collapses
 test_pane_agent_state_done_treehouse_get_chain_collapses
 test_pane_agent_state_done_other_treehouse_command_remains_live
+test_pane_agent_state_done_treehouse_root_wrapper_remains_live
 test_pane_agent_state_done_branching_shell_chain_remains_live
 test_pane_agent_state_done_real_pi_foreground_remains_live
 test_pane_agent_state_idle_non_shell_foreground_remains_live

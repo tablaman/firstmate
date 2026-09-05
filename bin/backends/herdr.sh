@@ -1286,6 +1286,9 @@ fm_backend_herdr_pane_idle_shell_sample() {  # <session> <pane-id>
     hops=$((hops + 1))
     [ "$hops" -le "$max_hops" ] || return 1
     if ! fm_backend_herdr_pid_is_bare_shell "$ps_bin" "$current"; then
+      if [ "$current" = "$shell_pid" ] || [ "$current" = "$foreground_pid" ]; then
+        return 1
+      fi
       fm_backend_herdr_pid_is_treehouse_get "$ps_bin" "$current" || return 1
       treehouse_get_count=$((treehouse_get_count + 1))
       [ "$treehouse_get_count" -le 1 ] || return 1
