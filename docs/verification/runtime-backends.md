@@ -665,7 +665,7 @@ The relaunched harness comes up in a scratch worktree Claude Code has never trus
 The non-shell stand-in must outlast the whole exit verb, whose delivery-confirmation cycle can exceed a minute against a live server; a stand-in that expires mid-verb collapses the pane to a genuine lone idle shell and makes a later `stopped` a correct observation of the wrong scenario.
 The non-shell exit-refusal, direct nested-shell acceptance, exact `treehouse get` acceptance, rejection of other Treehouse commands, and first-sample fail-fast semantics are additionally pinned hermetically (by exact process-info query counts) in `tests/fm-backend-herdr.test.sh`.
 That command is the guard that refreshes this record; run the full test after every Herdr upgrade rather than trusting the versions above (interrupt-survival previously measured 2026-08-02 on Herdr 0.7.5 and 2026-08-08 on Herdr 0.8.0 under the pre-rewrite test revision).
-The hermetic pins in `tests/fm-backend-herdr.test.sh` plus the portable control regressions `tests/fm-control.test.sh` and `tests/fm-control-relaunch.test.sh` were last re-run green on 2026-09-05 while this branch's delivery attestation was rebound to a new PR head.
+The hermetic pins in `tests/fm-backend-herdr.test.sh` plus the portable control regressions `tests/fm-control.test.sh` and `tests/fm-control-relaunch.test.sh` were last re-run green on 2026-09-05 (194 hermetic assertions, zero failures) for the second attestation rebind of that day, after the prior evidence commit reached the PR branch without a gate re-push and left the attestation stale again.
 
 ### Away-mode transport
 
