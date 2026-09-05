@@ -3,10 +3,12 @@ state/
 data/
 scratchpad*
 .no-mistakes/
+.tools/
 .lavish/
 .fm-secondmate-home
 .fm-secondmate-parent
 .DS_Store
+.CLAUDE.md.lock
 __pycache__/
 *.pyc
 .env

@@ -509,7 +509,7 @@ ok - version floor: an unconfigured home stays projected on herdr 0.8.0 and the 
 evidence: herdr=0.8.0 protocol=19 steal_live=0 floor_verdict=0 default-session-tripwire=armed
 ```
 
-Part C is the case the suite could not reach before: a doomed pane whose shell holds a persistent background child fails the lone-idle-shell proof on every sample, so the plan takes the plain explicit close, in the geometry where the closing workspace's right neighbour is a spacer rather than the focused anchor.
+Part C is the case the suite could not reach before: a doomed pane whose shell holds a persistent background child fails the idle-shell-chain proof on every sample, so the plan takes the plain explicit close, in the geometry where the closing workspace's right neighbour is a spacer rather than the focused anchor.
 On 0.7.5 that fallback exposed a bounded four-sample wrong-focus window and restored the anchor exactly; on 0.8.0 the same fallback exposed none, which is why default-on projection is floored at 0.8.0 rather than mitigated further below it.
 The suite also cross-checks its own Part A measurement against the floor classifier on whatever release it runs, so a drifted protocol-to-release mapping fails there rather than silently gating on the wrong thing.
 
@@ -635,24 +635,37 @@ Polling remained active and is covered as the fallback for capability, connect, 
 
 ### Agent lifecycle control
 
-Herdr is one of the two backends whose recovery-grade agent-state classifier the control plane may trust ([agent-control.md](../agent-control.md)), so its lifecycle gating is measured against the real binary; reverified 2026-08-08 on Herdr 0.8.0, and first measured 2026-08-02 on Herdr 0.7.5 with identical results:
+Herdr is one of the two backends whose recovery-grade agent-state classifier the control plane may trust ([agent-control.md](../agent-control.md)), so its lifecycle gating is measured against the real binary:
 
 ```sh
 tests/fm-control-herdr-smoke.test.sh
 ```
 
-Observed output:
+The test's first case begins with no registered agent, then plants a stale idle/done registration over a lone shell: interrupt must refuse, exit must report already-stopped, relaunch must resurrect the same pane and worktree, and interrupt on the relaunched real agent must deliver with the agent-alive proof and leave the agent classified alive.
+The nested-chain case runs Treehouse's interactive `get` command so the pane shell hosts one sleeping `treehouse get` wrapper whose sole child is the idle pooled-worktree shell, then plants the same stale registration; exit must collapse that exact linear chain to already-stopped like the lone-shell case.
+The last case keeps an idle registration over a non-shell foreground command: its classification must come back live on the first proof sample (bounded well under a deliberately inflated 100-poll settle budget), and exit must refuse rather than pretending the agent stopped.
+The registry read through `herdr pane report-agent` is the same source `fm_backend_herdr_agent_state` classifies, so these cases exercise exactly the gate every lifecycle verb depends on.
+The idle-shell legs require the pane's interactive shell to come up bare; an operator shell shim that wraps the pane shell defeats the strict idle-shell-chain proof, and the proof's refusal there is correct behavior, not a test defect.
+Because the lab's pane shells inherit the environment of whatever terminal launched the test, a fig/Amazon Q/kiro-cli terminal integration in the operator's shell rc would wrap them in its `kiro-cli-term` pty shim exactly when the invoking terminal was NOT itself already wrapped - making the idle-shell legs pass or fail on where the test was started from (diagnosed 2026-09-03 by pane process-info: the wrapped pane's foreground process is `zsh (kiro-cli-term)` with a child `/bin/zsh --login`).
+The test therefore exports the integration's own suppress markers (`PROCESS_LAUNCHED_BY_Q`, `Q_TERM`) before provisioning the lab so pane shells deterministically come up bare.
+
+On 2026-09-04 with Herdr 0.8.0 and Treehouse 2.1.1 the full six-leg test passed against the real binaries:
 
 ```text
-ok - real herdr: exit on a pane with no registered agent is idempotent success
 ok - real herdr: interrupt refuses when herdr's own agent registry reports no agent
-ok - real herdr: interrupt delivers the harness's key and proves the agent survived it
-ok - real herdr: no control verb removed the endpoint or the task's local copy
-ok - real herdr: an agent that does not stop fails closed instead of being reported as stopped
+ok - real herdr: exit on a stale idle registration over a lone shell is already-stopped
+ok - real herdr: relaunch reuses the same pane and worktree, and the endpoint/local copy remain
+ok - real herdr: interrupt delivers the harness's key to the relaunched agent and proves it survived
+ok - real herdr: a stale idle registration over a treehouse-get shell chain recovers as already-stopped
+ok - real herdr: a live non-shell foreground process classifies live fast and refuses exit
 ```
 
-The registry read through `herdr pane report-agent` is the same source `fm_backend_herdr_agent_state` classifies, so registering and not registering an agent on a plain shell pane exercises exactly the gate every lifecycle verb depends on, with no real agent launched.
-That command is the guard that refreshes this record; run it after every Herdr upgrade rather than trusting the version above.
+Two properties of the live environment gate the survival and refusal legs, and the test accounts for both.
+The relaunched harness comes up in a scratch worktree Claude Code has never trusted, so its startup folder-trust dialog can render first and answer the interrupt key (Escape) with "No, exit" - interrupting there kills the agent instead of proving survival, so the test polls after relaunch and accepts the dialog when it renders, without asserting that it does (a production relaunch resurrects an already-trusted worktree where no dialog appears, and the poll simply times out with the agent already at its prompt; diagnosed by pane capture during the 2026-09-03 run).
+The non-shell stand-in must outlast the whole exit verb, whose delivery-confirmation cycle can exceed a minute against a live server; a stand-in that expires mid-verb collapses the pane to a genuine lone idle shell and makes a later `stopped` a correct observation of the wrong scenario.
+The non-shell exit-refusal, direct nested-shell acceptance, exact `treehouse get` acceptance, rejection of other Treehouse commands, and first-sample fail-fast semantics are additionally pinned hermetically (by exact process-info query counts) in `tests/fm-backend-herdr.test.sh`.
+That command is the guard that refreshes this record; run the full test after every Herdr upgrade rather than trusting the versions above (interrupt-survival previously measured 2026-08-02 on Herdr 0.7.5 and 2026-08-08 on Herdr 0.8.0 under the pre-rewrite test revision).
+The hermetic pins in `tests/fm-backend-herdr.test.sh` plus the portable control regressions `tests/fm-control.test.sh` and `tests/fm-control-relaunch.test.sh` were last re-run green on 2026-09-05 (195 hermetic assertions after the bare-shell chain-root pin landed, zero failures) for the third attestation rebind of that day, after the CI-fix commit reached the PR branch without a gate re-push and left the attestation stale once more.
 
 ### Away-mode transport
 

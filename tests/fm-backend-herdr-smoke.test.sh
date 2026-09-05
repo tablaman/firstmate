@@ -120,7 +120,11 @@ pass "real herdr: create_task prunes the freshly-created workspace's seeded defa
 # still depends on) so neither scenario disturbs it.
 
 # 1. A genuinely LIVE duplicate (a real registered agent, via herdr's own
-#    `pane report-agent`) must still refuse exactly as before.
+#    `pane report-agent`, over real non-shell foreground work) must still
+#    refuse exactly as before. A bare registration over a lone idle shell is
+#    no longer enough: the idle-shell-chain recovery deliberately treats that
+#    as a settled husk, so the live scenario keeps a non-shell process in the
+#    pane's foreground exactly like a real running harness.
 LIVE_DUP_LABEL="fm-smoke-livedup"
 LIVE_DUP_IDS=$(fm_backend_herdr_create_task "$CONTAINER" "$LIVE_DUP_LABEL" /tmp) || fail "could not create the live-duplicate scenario's tab"
 read -r LIVE_DUP_TAB_ID LIVE_DUP_PANE_ID <<EOF
@@ -131,8 +135,19 @@ if [ -z "$LIVE_DUP_TAB_ID" ] || [ -z "$LIVE_DUP_PANE_ID" ]; then
 fi
 herdr pane report-agent "$LIVE_DUP_PANE_ID" --source fm-smoke-test --agent fm-smoke-live-agent --state idle --session "$SESSION" >/dev/null 2>&1 \
   || fail "could not register a live agent on the live-duplicate scenario's pane"
+LIVE_DUP_STATE=
+for _ in 1 2 3 4 5; do
+  fm_backend_herdr_send_text_line "$SESSION:$LIVE_DUP_PANE_ID" 'exec sleep 300' || true
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    LIVE_DUP_STATE=$(fm_backend_herdr_pane_agent_state "$SESSION" "$LIVE_DUP_PANE_ID")
+    [ "$LIVE_DUP_STATE" = live ] && break 2
+    sleep 0.2
+  done
+done
+[ "$LIVE_DUP_STATE" = live ] \
+  || fail "the live-duplicate scenario's pane never classified live over its non-shell foreground work (got '$LIVE_DUP_STATE')"
 if fm_backend_herdr_create_task "$CONTAINER" "$LIVE_DUP_LABEL" /tmp >/dev/null 2>&1; then
-  fail "REGRESSION: create_task should refuse a duplicate label whose pane hosts a genuinely live registered agent (idle counts as live)"
+  fail "REGRESSION: create_task should refuse a duplicate label whose pane hosts a genuinely live registered agent"
 fi
 herdr pane get "$LIVE_DUP_PANE_ID" --session "$SESSION" >/dev/null 2>&1 \
   || fail "REGRESSION: the live-duplicate scenario's pane should have survived the refused create_task call untouched"

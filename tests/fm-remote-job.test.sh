@@ -276,6 +276,15 @@ fm_remote_job_ensure_worker "$RELOCATED_ROOT" "$ACCOUNT_HOME" \
   || fail "$FM_REMOTE_JOB_ERROR"
 NEW_WORKER_PID=$(cat "$STATE_ROOT/worker.pid")
 [ "$NEW_WORKER_PID" != "$OLD_WORKER_PID" ] || fail "ensure retained a worker bound to a different code root"
+# Replacement guarantees the displaced tree stops, not that it is gone in the
+# same instant: a displaced supervisor that lost the ownership race exits only
+# after its final child observes the lost lock (exit 75), behind at most one
+# restart backoff. Give that self-termination its bounded window; a genuinely
+# surviving supervisor group still fails after it.
+for _ in $(seq 1 100); do
+  kill -0 -- "-$OLD_WORKER_PGID" 2>/dev/null || break
+  sleep 0.1
+done
 ! kill -0 -- "-$OLD_WORKER_PGID" 2>/dev/null \
   || fail "ensure left the replaced worker supervisor group alive"
 fm_remote_job_stage "$ACCOUNT_HOME" "$RELOCATED_ROOT" "$REMOTE_HOME" fm-probe-job.sh < /dev/null > /dev/null

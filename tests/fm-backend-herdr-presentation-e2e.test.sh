@@ -831,6 +831,17 @@ assert_no_ordering_lifecycle_calls_since "$FAIL_START" "failed presentation orde
 pass "real Herdr lab: forced workspace.move failure leaves a successful worker in default order with a warning and no cleanup"
 
 mkdir -p "$POST_CREATE_ABORT_CONTROL"
+# The serialization audit below observes cleanup only through the wrapper's
+# `pane close` CLI calls. A pane whose shell proves an idle shell chain would
+# route the abort cleanup down the focus-preserving pane-death path (a direct
+# signal the wrapper cannot see), and whether the doomed task pane's shell
+# proves varies by platform and Herdr release. Pin the process proof to its
+# documented
+# unreadable-evidence refusal so cleanup deterministically falls back to the
+# plain audited close everywhere; the pane-death route itself is covered by
+# the portable close-plan regressions in tests/fm-backend-herdr.test.sh.
+export FM_HERDR_PS_BIN="$TMP_ROOT/no-such-ps"
+export FM_BACKEND_HERDR_IDLE_SHELL_PROOF_POLLS=1
 ABORT_START=$(log_line_count)
 ABORT_FOCUS_START=$(focus_audit_line_count)
 spawn_task abort-a "$HOME_DIR" "$PROJECT_DIR" > "$TMP_ROOT/abort-a.out" 2> "$TMP_ROOT/abort-a.err" &
@@ -875,6 +886,7 @@ done
   || fail "post-create abort fixtures published task metadata before launch"
 rm -rf "$POST_CREATE_ABORT_CONTROL"
 rm -f "$HOME_DIR/state/abort-a.herdr-presentation" "$HOME_DIR/state/abort-b.herdr-presentation"
+unset FM_HERDR_PS_BIN FM_BACKEND_HERDR_IDLE_SHELL_PROOF_POLLS
 pass "real Herdr lab: concurrent post-create abort cleanup stays serialized with exact focus restoration"
 
 SHAPE_CLEANUP_AUDIT_START=$(focus_audit_line_count)
@@ -1403,6 +1415,20 @@ lab workspace get "$DUP2_WSID" >/dev/null 2>&1 || fail "duplicate-token recovery
 
 lab pane report-agent "$DUP1_PANE" --source fm-projection-e2e --agent test-agent --state idle >/dev/null \
   || fail "could not register the duplicate-live-agent risk fixture"
+# An idle registration over a lone idle shell is deliberately recoverable
+# under the idle-shell-chain proof, so the live-risk fixture needs real
+# non-shell foreground work in the pane to model a genuinely live agent.
+DUP_LIVE_STATE=
+for _ in 1 2 3 4 5; do
+  lab pane run "$DUP1_PANE" 'exec sleep 300' >/dev/null 2>&1 || true
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    DUP_LIVE_STATE=$(fm_backend_herdr_pane_agent_state "$HERDR_LAB_SESSION" "$DUP1_PANE")
+    [ "$DUP_LIVE_STATE" = live ] && break 2
+    sleep 0.2
+  done
+done
+[ "$DUP_LIVE_STATE" = live ] \
+  || fail "the duplicate-live-agent risk pane never classified live over its non-shell foreground work (got '$DUP_LIVE_STATE')"
 START=$(log_line_count)
 if fm_backend_herdr_projection_recovery_allows_flat "$HERDR_LAB_SESSION" "$DUP_JOURNAL" duplicate1; then
   fail "a duplicate token match with a registered agent should refuse fallback"

@@ -9,13 +9,14 @@
 # an agent is running, and therefore whether a lifecycle verb may act at all,
 # comes from herdr's own agent registry.
 #
-# No real agent is launched. herdr's `pane report-agent` is the same registry
-# the adapter reads, so registering and not registering an agent on a plain
-# shell pane exercises exactly the classification the control plane gates on.
+# The smoke runs six isolated real-Herdr cases: interrupt refusal with no
+# agent, stale idle-registration exit, relaunch reuse, interrupt survival on
+# the relaunched agent, nested idle-shell-chain recovery, and fast live
+# non-shell exit refusal.
 #
 # Always runs on a private, named, throwaway lab session, never the default
 # one (tests/herdr-test-safety.sh; the 2026-07-02 incident). Skips cleanly
-# when herdr or jq is missing.
+# when herdr, Treehouse, jq, or claude is missing.
 set -u
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -24,7 +25,9 @@ fail() { printf 'not ok - %s\n' "$1" >&2; cleanup_all; exit 1; }
 pass() { printf 'ok - %s\n' "$1"; }
 
 command -v herdr >/dev/null 2>&1 || { echo "skip: herdr not found"; exit 0; }
+command -v treehouse >/dev/null 2>&1 || { echo "skip: treehouse not found"; exit 0; }
 command -v jq >/dev/null 2>&1 || { echo "skip: jq not found (required by the herdr adapter)"; exit 0; }
+command -v claude >/dev/null 2>&1 || { echo "skip: claude not found"; exit 0; }
 
 # shellcheck source=tests/herdr-test-safety.sh
 . "$ROOT/tests/herdr-test-safety.sh"
@@ -34,11 +37,26 @@ SESSION="fm-lab-control-smoke-$$"
 export HERDR_SESSION="$SESSION"
 SCRATCH=
 cleanup_all() {
+  trap - EXIT
   [ -n "$SCRATCH" ] && rm -rf "$SCRATCH"
   herdr_safe_stop_and_delete "$SESSION"
 }
 trap cleanup_all EXIT
-fm_herdr_lab_prepare "$SESSION" || fail "could not prepare isolated Herdr lab session"
+
+# The lone-shell legs require the pane's interactive shell to come up bare,
+# and pane shells inherit the lab server's environment, which inherits this
+# test's. An operator terminal-integration shim (fig/Amazon Q/kiro-cli's
+# kiro-cli-term) execs the pane's zsh into a pty wrapper with a child shell,
+# which the strict lone-idle-shell proof then correctly refuses to collapse -
+# so whether legs 2-6 can even observe the recovery behavior would depend on
+# whether the terminal that launched the test was itself already wrapped
+# (those markers suppress re-wrapping). Export the integration's own
+# "already wrapped / launched by the tool" markers so the lab's pane shells
+# deterministically skip the shim regardless of the invoking terminal.
+export PROCESS_LAUNCHED_BY_Q=1
+export Q_TERM=1
+
+fm_herdr_lab_provision "$SESSION" || fail "could not provision isolated Herdr lab session"
 
 SCRATCH=$(mktemp -d "${TMPDIR:-/tmp}/fm-control-herdr.XXXXXX")
 SCRATCH=$(cd "$SCRATCH" && pwd)
@@ -55,6 +73,13 @@ printf '# proj\n' > "$PROJ/README.md"
 git -C "$PROJ" add README.md
 git -C "$PROJ" -c user.name='Firstmate Tests' -c user.email='tests@example.invalid' commit -qm initial
 git -C "$PROJ" worktree add --quiet -b hsmoke "$WT"
+WT=$(cd "$WT" && pwd -P)
+WT2="$SCRATCH/wt2"
+git -C "$PROJ" worktree add --quiet -b hsmoke-live "$WT2"
+WT2=$(cd "$WT2" && pwd -P)
+WT3="$SCRATCH/wt3"
+git -C "$PROJ" worktree add --quiet -b hsmoke-nest "$WT3"
+WT3=$(cd "$WT3" && pwd -P)
 
 # shellcheck source=/dev/null
 . "$ROOT/bin/fm-backend.sh"
@@ -91,59 +116,229 @@ EOF
 
 run_control() {
   env FM_HOME="$HOME_DIR" HERDR_SESSION="$SESSION" \
-    FM_CONTROL_POLL=0.2 FM_CONTROL_EXIT_WAIT=2 \
+    FM_CONTROL_POLL=0.2 FM_CONTROL_EXIT_WAIT=2 FM_CONTROL_LAUNCH_WAIT=10 FM_BACKEND_HERDR_IDLE_SHELL_PROOF_POLLS=30 \
     "$ROOT/bin/fm-control.sh" "$@" 2>&1
 }
 
-# --- no registered agent: the endpoint exists but hosts no agent ------------
+# --- no registered agent: interrupt refuses --------------------------------
 
-OUT=$(run_control hsmoke exit) || fail "exit against an agent-free herdr pane should be idempotent success: $OUT"
-case "$OUT" in
-  "already-stopped hsmoke"*) : ;;
-  *) fail "an agent-free herdr pane should report already-stopped, got: $OUT" ;;
-esac
-pass "real herdr: exit on a pane with no registered agent is idempotent success"
-
-if OUT=$(run_control hsmoke interrupt 2>&1); then
-  fail "interrupt should refuse when herdr reports no agent on the pane: $OUT"
-fi
+OUT=$(run_control hsmoke interrupt); RC=$?
+[ "$RC" -eq 1 ] || fail "interrupt against the idle task should refuse, got rc=$RC: $OUT"
 case "$OUT" in
   *"nothing to interrupt"*) : ;;
-  *) fail "the interrupt refusal should say there is no agent, got: $OUT" ;;
+  *) fail "interrupt should refuse when herdr's own agent registry reports no agent, got: $OUT" ;;
 esac
 pass "real herdr: interrupt refuses when herdr's own agent registry reports no agent"
 
-# --- a registered agent: classification flips, and the verbs follow ---------
+# --- stale settled registration on a lone shell: exit is already-stopped ----
 
 herdr pane report-agent "$PANE_ID" --source fm-control-smoke --agent fm-control-smoke-agent \
   --state idle --session "$SESSION" >/dev/null 2>&1 \
-  || fail "could not register a live agent on the task pane"
+  || fail "could not register a stale agent on the task pane"
+sleep 1
 
+OUT=$(run_control hsmoke exit) || fail "exit against a stale-shell herdr pane should be idempotent success: $OUT"
+case "$OUT" in
+  "already-stopped hsmoke"*) : ;;
+  *) fail "a stale-shell herdr pane should report already-stopped, got: $OUT" ;;
+esac
+pass "real herdr: exit on a stale idle registration over a lone shell is already-stopped"
+
+# --- relaunch reuses the same pane/worktree ---------------------------------
+
+OUT=$(run_control hsmoke relaunch --note "stale shell recovered in place") \
+  || fail "relaunch against the stale shell should succeed in place: $OUT"
+case "$OUT" in
+  *"relaunched hsmoke harness=claude"*"backend=herdr"*"endpoint=$SESSION:$PANE_ID"*"worktree=$WT"*) : ;;
+  *) fail "relaunch should reuse the same pane and worktree, got: $OUT" ;;
+esac
 STATE=$(fm_backend_agent_state herdr "$SESSION:$PANE_ID")
-[ "$STATE" = alive ] || fail "herdr should classify a registered agent as alive, got '$STATE'"
+[ "$STATE" = alive ] || fail "the relaunched pane should be classified alive, got '$STATE'"
+CUR_PATH=$(fm_backend_herdr_current_path "$SESSION:$PANE_ID")
+[ "$CUR_PATH" = "$WT" ] || fail "the relaunched pane should still read the task worktree path, got: $CUR_PATH"
+sleep 1
+INFO=
+for _ in 1 2 3 4 5 6; do
+  INFO=$(herdr pane process-info --pane "$PANE_ID" --session "$SESSION" 2>/dev/null) && break
+  sleep 0.5
+done
+[ -n "$INFO" ] || fail "the relaunched pane should still be readable as a real Herdr process-info target"
+SHELL_PID=$(printf '%s' "$INFO" | jq -r '.result.process_info.shell_pid // empty')
+FG_PID=$(printf '%s' "$INFO" | jq -r '.result.process_info.foreground_processes[0].pid // empty')
+[ -n "$SHELL_PID" ] && [ -n "$FG_PID" ] || fail "the relaunched pane did not report both shell and foreground pids: $INFO"
+[ "$SHELL_PID" != "$FG_PID" ] || fail "the relaunched pane should be the nested-shell worktree shape, got shell_pid=$SHELL_PID foreground_pid=$FG_PID"
+pass "real herdr: relaunch reuses the same pane and worktree, and the endpoint/local copy remain"
 
-OUT=$(run_control hsmoke interrupt) || fail "interrupt against a registered agent should succeed: $OUT"
+# --- interrupt on the relaunched agent delivers and proves it survived ------
+
+# The relaunched harness comes up in a scratch worktree this test just
+# created, which Claude Code has never seen, so its startup folder-trust
+# dialog may render first - and that dialog answers the interrupt key
+# (Escape) with "No, exit", so interrupting there kills the agent instead of
+# proving it survives. A production relaunch resurrects an already-trusted
+# task worktree where no dialog appears, so if the dialog shows up, accept it
+# once to reach that same trusted, idle-agent state before the lifecycle verb
+# runs. Rendering the dialog is NOT asserted: in an environment where the
+# worktree is pre-trusted the poll simply times out with the agent already at
+# its prompt, and the leg proceeds identically.
+TRUST_POLLS=40
+while [ "$TRUST_POLLS" -gt 0 ]; do
+  PANE_TEXT=$(herdr pane read "$PANE_ID" --source recent --lines 200 --session "$SESSION" 2>/dev/null | tail -30)
+  case "$PANE_TEXT" in
+    *"trust this folder"*)
+      herdr pane send-keys "$PANE_ID" enter --session "$SESSION" >/dev/null 2>&1 \
+        || fail "could not accept the relaunched harness's folder-trust dialog"
+      sleep 2
+      break ;;
+  esac
+  TRUST_POLLS=$((TRUST_POLLS - 1))
+  sleep 0.5
+done
+
+OUT=$(run_control hsmoke interrupt) || fail "interrupt against the relaunched agent should succeed: $OUT"
 case "$OUT" in
   *"interrupt-delivered hsmoke harness=claude backend=herdr verified=agent-alive cancel=unconfirmed"*) : ;;
   *) fail "interrupt should report the agent-alive proof on herdr, got: $OUT" ;;
 esac
-pass "real herdr: interrupt delivers the harness's key and proves the agent survived it"
+STATE=$(fm_backend_agent_state herdr "$SESSION:$PANE_ID")
+[ "$STATE" = alive ] || fail "the relaunched agent must survive its interrupt key, got '$STATE'"
+pass "real herdr: interrupt delivers the harness's key to the relaunched agent and proves it survived"
 
-herdr pane get "$PANE_ID" --session "$SESSION" >/dev/null 2>&1 \
-  || fail "the control plane must never remove the endpoint it was operating on"
-[ -d "$WT" ] || fail "the control plane must never remove the task's local copy"
-pass "real herdr: no control verb removed the endpoint or the task's local copy"
+# --- a nested idle shell chain recovers as a settled husk --------------------
 
-# Last, because it deliberately types a harness command into a pane that hosts
-# a plain shell: the registered agent cannot actually be stopped that way, and
-# the control plane must say so rather than report a stop it did not achieve.
-if OUT=$(run_control hsmoke exit 2>&1); then
-  fail "exit should fail closed when the agent does not stop: $OUT"
+# The real Treehouse worktree shape: the pane's own shell hosts a sleeping
+# `treehouse get` wrapper whose one child is the idle pooled-worktree shell.
+# A stale settled registration over that nested chain must collapse to
+# already-stopped exactly like the lone-shell case - this is the narrow
+# wrapper acceptance the hermetic suite pins, observed here against both real
+# Treehouse and Herdr binaries.
+TASK3_IDS=$(fm_backend_herdr_create_task "$CONTAINER" "fm-hsmoke-nest" "$WT3") \
+  || fail "create_task for the nested-chain recovery case failed"
+read -r TAB3_ID PANE3_ID <<EOF
+$TASK3_IDS
+EOF
+[ -n "$TAB3_ID" ] && [ -n "$PANE3_ID" ] || fail "the nested-chain recovery task did not return tab/pane ids"
+
+{
+  echo "window=$SESSION:$PANE3_ID"
+  echo "endpoint_task_id=hsmoke-nest"
+  echo "worktree=$WT3"
+  echo "project=$PROJ"
+  echo "harness=claude"
+  echo "kind=ship"
+  echo "mode=no-mistakes"
+  echo "yolo=off"
+  echo "model=default"
+  echo "effort=default"
+  echo "backend=herdr"
+  echo "herdr_session=$SESSION"
+  echo "herdr_workspace_id=$WORKSPACE_ID"
+  echo "herdr_tab_id=$TAB3_ID"
+  echo "herdr_pane_id=$PANE3_ID"
+} > "$HOME_DIR/state/hsmoke-nest.meta"
+
+OUT=$(fm_backend_herdr_send_text_line "$SESSION:$PANE3_ID" "treehouse get") \
+  || fail "could not start the Treehouse worktree shell"
+sleep 2
+
+INFO=
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  INFO=$(herdr pane process-info --pane "$PANE3_ID" --session "$SESSION" 2>/dev/null) || INFO=
+  SHELL3_PID=$(printf '%s' "$INFO" | jq -r '.result.process_info.shell_pid // empty' 2>/dev/null)
+  FG3_PID=$(printf '%s' "$INFO" | jq -r '
+    .result.process_info.foreground_processes
+    | select(type == "array" and length == 1)
+    | .[0].pid // empty
+  ' 2>/dev/null)
+  [ -n "$SHELL3_PID" ] && [ -n "$FG3_PID" ] && break
+  sleep 0.5
+done
+[ -n "$SHELL3_PID" ] && [ -n "$FG3_PID" ] \
+  || fail "the Treehouse worktree shell did not expose one stable foreground process: $INFO"
+TREEHOUSE3_PID=$(ps -p "$FG3_PID" -o ppid= 2>/dev/null | tr -d '[:space:]')
+TREEHOUSE3_PARENT=$(ps -p "$TREEHOUSE3_PID" -o ppid= 2>/dev/null | tr -d '[:space:]')
+TREEHOUSE3_COMM=$(ps -p "$TREEHOUSE3_PID" -o comm= 2>/dev/null | tr -d '[:space:]')
+TREEHOUSE3_COMM=${TREEHOUSE3_COMM##*/}
+TREEHOUSE3_ARGS=$(ps -p "$TREEHOUSE3_PID" -o args= 2>/dev/null)
+if ! { [ "$TREEHOUSE3_PARENT" = "$SHELL3_PID" ] \
+  && [ "$TREEHOUSE3_COMM" = treehouse ] \
+  && printf '%s\n' "$TREEHOUSE3_ARGS" | awk 'NF == 2 { command = $1; sub(/^.*\//, "", command); exit !(command == "treehouse" && $2 == "get") } { exit 1 }'; }; then
+  fail "the nested recovery leg did not create pane-shell -> treehouse-get -> foreground-shell: $INFO"
+fi
+
+herdr pane report-agent "$PANE3_ID" --source fm-control-smoke --agent fm-control-smoke-agent \
+  --state idle --session "$SESSION" >/dev/null 2>&1 \
+  || fail "could not register a stale agent on the nested-chain pane"
+sleep 1
+
+OUT=$(run_control hsmoke-nest exit) \
+  || fail "exit against a nested idle shell chain should be idempotent success: $OUT"
+case "$OUT" in
+  "already-stopped hsmoke-nest"*) : ;;
+  *) fail "a nested idle shell chain should report already-stopped, got: $OUT" ;;
+esac
+STATE=$(fm_backend_agent_state herdr "$SESSION:$PANE3_ID")
+[ "$STATE" = dead ] || fail "the nested idle shell chain should classify dead, got '$STATE'"
+pass "real herdr: a stale idle registration over a treehouse-get shell chain recovers as already-stopped"
+
+# --- a live non-shell foreground process still refuses exit ------------------
+
+TASK2_IDS=$(fm_backend_herdr_create_task "$CONTAINER" "fm-hsmoke-live" "$WT2") \
+  || fail "create_task for the non-shell refusal case failed"
+read -r TAB2_ID PANE2_ID <<EOF
+$TASK2_IDS
+EOF
+[ -n "$TAB2_ID" ] && [ -n "$PANE2_ID" ] || fail "the non-shell refusal task did not return tab/pane ids"
+
+{
+  echo "window=$SESSION:$PANE2_ID"
+  echo "endpoint_task_id=hsmoke-live"
+  echo "worktree=$WT2"
+  echo "project=$PROJ"
+  echo "harness=claude"
+  echo "kind=ship"
+  echo "mode=no-mistakes"
+  echo "yolo=off"
+  echo "model=default"
+  echo "effort=default"
+  echo "backend=herdr"
+  echo "herdr_session=$SESSION"
+  echo "herdr_workspace_id=$WORKSPACE_ID"
+  echo "herdr_tab_id=$TAB2_ID"
+  echo "herdr_pane_id=$PANE2_ID"
+} > "$HOME_DIR/state/hsmoke-live.meta"
+
+herdr pane report-agent "$PANE2_ID" --source fm-control-smoke --agent fm-control-smoke-agent \
+  --state idle --session "$SESSION" >/dev/null 2>&1 \
+  || fail "could not register the live non-shell refusal agent"
+sleep 1
+
+# The stand-in process must outlast the whole exit verb, not just its final
+# postcondition wait: exit's delivery confirmation (Enter retries, native
+# agent-state waits, composer verdicts, and the idle-branch shell proof's own
+# retry budget on every classification) can take over a minute against a live
+# server. A sleep that expires mid-verb collapses the pane to a genuine lone
+# idle shell, so a later 'stopped' would be a correct observation of the wrong
+# scenario rather than the refusal this leg pins.
+OUT=$(fm_backend_herdr_send_text_line "$SESSION:$PANE2_ID" "sleep 600") \
+  || fail "could not start the non-shell foreground process"
+sleep 0.5
+
+# A conclusively non-shell lone foreground process must classify live on the
+# first proof sample: even under a 100-poll settle budget (>=9.9s of sleeps
+# alone if the budget were burned) the classification must come back well
+# under that floor.
+CLASSIFY_START=$(date +%s)
+STATE=$(FM_BACKEND_HERDR_IDLE_SHELL_PROOF_POLLS=100 fm_backend_agent_state herdr "$SESSION:$PANE2_ID")
+CLASSIFY_ELAPSED=$(( $(date +%s) - CLASSIFY_START ))
+[ "$STATE" = alive ] || fail "the non-shell foreground process should stay alive, got '$STATE'"
+[ "$CLASSIFY_ELAPSED" -le 8 ] || fail "classifying a live non-shell pane should not burn the settle budget, took ${CLASSIFY_ELAPSED}s"
+
+if OUT=$(run_control hsmoke-live exit 2>&1); then
+  fail "exit should fail closed when the non-shell foreground process does not stop: $OUT"
 fi
 case "$OUT" in
   *"did not stop"*) : ;;
-  *) fail "the exit failure should say the agent did not stop, got: $OUT" ;;
+  *) fail "the non-shell exit failure should say the agent did not stop, got: $OUT" ;;
 esac
-pass "real herdr: an agent that does not stop fails closed instead of being reported as stopped"
-
-fm_backend_herdr_kill "$SESSION:$PANE_ID" 2>/dev/null || true
+pass "real herdr: a live non-shell foreground process classifies live fast and refuses exit"

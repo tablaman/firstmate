@@ -36,7 +36,7 @@
 # both fixes first shipped in Herdr 0.8.0, which is the version floor for
 # default-on projection (FM_BACKEND_HERDR_MIN_PRESENTATION_VERSION). Projected cleanup
 # therefore serializes under the session lock, repositions a doomed workspace
-# behind the focused one when needed, and ends its verified lone idle shell
+# behind the focused one when needed, and ends its verified idle shell chain root
 # so Herdr removes the emptied workspace through the focus-preserving
 # pane-death path, with the exact pre-close tab restore as the backstop and a
 # refusal to close the active tab itself.
@@ -103,8 +103,8 @@ FM_BACKEND_HERDR_MIN_WORKSPACE_MOVE_PROTOCOL=16
 # The version floor for DEFAULT-ON presentation projection. Projection turns
 # every crewmate teardown into a workspace-emptying removal, and the focus-safe
 # removal plan can only avoid Herdr's focus-stealing explicit close while the
-# doomed pane holds a provably lone idle childless shell; a persistent child of
-# that shell (gitstatusd, a zsh-async worker, direnv) makes the plan fall back
+# doomed pane holds a provably idle linear shell chain; a persistent non-shell
+# child of any chain shell (gitstatusd, a zsh-async worker, direnv) makes the plan fall back
 # to the plain explicit close, which steals focus on every release without the
 # two upstream focus fixes (PR #1877 commit 165dca45, PR #1912 commit a979916).
 # Herdr 0.8.0 is the first release carrying both, so a home that configured
@@ -832,8 +832,8 @@ fm_backend_herdr_projection_focus_restore() {  # <session> <snapshot> <operation
 # When the close would empty the target workspace, Herdr 0.7.5's explicit
 # close moves focus to the workspace's neighbor, so the close is planned by
 # fm_backend_herdr_emptying_close_plan: reposition the doomed workspace
-# behind the focused one when needed, then end the pane's verified lone idle
-# shell so Herdr removes the emptied workspace through its focus-preserving
+# behind the focused one when needed, then end the pane's verified idle shell
+# chain root so Herdr removes the emptied workspace through its focus-preserving
 # pane-death path. The exact-tab restore below remains the backstop, and any
 # ambiguity falls back to the plain explicit close, which the backstop masks
 # exactly as before this hardening.
@@ -930,14 +930,14 @@ fm_backend_herdr_projection_close_pane_focus_preserving() {  # <session> <pane-i
 #   by PR #1912, commit a979916).
 # Both fixes first shipped in Herdr 0.8.0 (protocol 19), verified 2026-08-05.
 # Firstmate therefore removes a doomed non-focused workspace by ending its
-# verified lone idle shell (the pane-death path), repositioning it behind the
+# verified idle shell chain root (the pane-death path), repositioning it behind the
 # focused workspace first when needed. Moving it to the end preserves every
 # other workspace's relative order, so no presentation ordering change
 # persists.
 # That reasoning covers the pane-death route only. The plan's plain-close
-# FALLBACK is reachable exactly when the doomed pane's shell cannot be proved
-# lone, childless, and idle - a persistent gitstatusd, zsh-async worker, or
-# direnv fails that proof permanently - and on a release without both fixes the
+# FALLBACK is reachable exactly when the doomed pane cannot be proved to hold
+# a single idle linear shell chain - a persistent gitstatusd, zsh-async worker,
+# or direnv fails that proof permanently - and on a release without both fixes the
 # fallback is the focus-stealing close itself, so the mitigation is conditional
 # rather than unconditional and a version gate IS required. Default-on
 # projection is therefore floored at FM_BACKEND_HERDR_MIN_PRESENTATION_VERSION,
@@ -981,7 +981,7 @@ fm_backend_herdr_workspace_move_capable() {  # <session>
 # exact pane. The LAST echoed line is the plan: "plain" (use the ordinary
 # explicit close; below the presentation version floor the exact-tab restore
 # backstop masks the focus move it causes when it empties a non-focused
-# workspace) or "death <shell-pid>" (end the proved lone idle shell so Herdr
+# workspace) or "death <shell-pid>" (end the proved idle shell chain root so Herdr
 # removes the emptied workspace through its focus-preserving pane-death path).
 # Whenever the repositioning mover was invoked, a preceding
 # "moved<TAB><ws><TAB><original-index><TAB><socket><TAB><focused><TAB><pre-move-order-json>"
@@ -992,7 +992,7 @@ fm_backend_herdr_workspace_move_capable() {  # <session>
 # and one pane, both the target), the target workspace to sit behind the
 # focused one (repositioned to the end first when it does not, with the move
 # verified against the server-returned order and focus), and the exact pane
-# to hold one provably lone idle recognized shell.
+# to hold one provably idle recognized shell chain.
 fm_backend_herdr_emptying_close_plan() {  # <session> <pane-id> <workspace-id> <tab-id> <focused-workspace-id>
   local session=$1 pane_id=$2 ws_id=$3 tab_id=$4 focused_ws=$5
   local tabs panes list indices r rest a len capable socket mover response move_status shell_pid before_order
@@ -1118,13 +1118,13 @@ FMEOF
   fi
 }
 
-# fm_backend_herdr_death_close_pane: end the exact pane's proved lone idle
-# shell so Herdr removes the emptied workspace through its focus-preserving
+# fm_backend_herdr_death_close_pane: end the exact pane's proved idle shell
+# chain root so Herdr removes the emptied workspace through its focus-preserving
 # pane-death path, then confirm the pane is gone.
 # Each signal is sent only while the exact pane still owns the recorded pid
-# as its lone idle shell: SIGHUP relies on the proof taken just before, and
+# as the chain root: SIGHUP relies on the proof taken just before, and
 # the SIGKILL escalation re-reads the pane's process information and refuses
-# unless the same pid is still the pane's strict bare idle shell, so an
+# unless the same pid is still the proven idle chain's root shell, so an
 # exited or reused pid is never signaled.
 # Returns 0 only when the pane is confirmed gone.
 fm_backend_herdr_death_close_pane() {  # <session> <pane-id> <shell-pid>
@@ -1175,27 +1175,56 @@ fm_backend_herdr_pid_is_bare_shell() {  # <ps-bin> <pid>
   return 1
 }
 
+# fm_backend_herdr_pid_is_treehouse_get: <pid> is the exact Treehouse wrapper
+# that opens one pooled-worktree subshell. The shell-chain proof separately
+# requires it to sleep with exactly one child and permits at most one wrapper,
+# so a different Treehouse command or a wrapper doing concurrent work refuses.
+fm_backend_herdr_pid_is_treehouse_get() {  # <ps-bin> <pid>
+  local comm args
+  comm=$("$1" -p "$2" -o comm= 2>/dev/null) || return 1
+  comm=$(printf '%s' "$comm" | tr -d '[:space:]')
+  comm=${comm#-}
+  comm=${comm##*/}
+  [ "$comm" = treehouse ] || return 1
+  args=$("$1" -p "$2" -o args= 2>/dev/null) || return 1
+  printf '%s\n' "$args" | awk '
+    NF == 2 {
+      command = $1
+      sub(/^.*\//, "", command)
+      if (command == "treehouse" && $2 == "get") exit 0
+    }
+    { exit 1 }
+  '
+}
+
 # fm_backend_herdr_pane_idle_shell_pid: print the shell pid of <pane-id> only
-# when the exact pane provably holds one lone idle recognized shell: pane
-# process-info agrees on the pane id, the shell pid is both the foreground
-# process group and the sole foreground process, the foreground process name
-# and argv0 resolve to the same recognized shell, the operating-system
-# process table shows exactly that one shell row with no child process, and
-# the shell sits in a sleeping or idle state.
+# when the exact pane provably holds one idle recognized shell chain: the
+# pane shell and the lone foreground shell are both recognized shells, the
+# chain may contain one exact sleeping `treehouse get` wrapper between them,
+# the foreground shell is the sole foreground process-group member, the
+# operating-system process table shows one linear chain from pane shell to
+# foreground shell with no branches or extra children, and every member in
+# that chain sits in a sleeping or idle state.
 # An idle interactive shell transiently hosts short-lived prompt helpers
 # (verified on the real 0.7.5 lab: a workspace.move relayout makes zsh redraw
 # its prompt, spawning starship as a second foreground process for a few
 # samples), so the proof retries strict single samples for a bounded settle
-# window and succeeds on the first fully clean one; a genuinely busy pane
-# fails every sample and still refuses.
+# window and succeeds on the first fully clean one. The settle window exists
+# only for that shell-shaped ambiguity: when a sample observes the pane's lone
+# foreground process as a conclusively non-shell program (sample exit 2 - a
+# live harness like pi, never a prompt helper hosted by an idle shell), the
+# proof refuses immediately instead of spending the remaining poll budget.
+# Every other failing sample - busy, branching, or unreadable evidence - is
+# retried and still refuses at the end of the window.
 # This is the single owner of the idle-shell proof; the session-start
 # projection cleanup and every pane-death close path both rely on it.
 fm_backend_herdr_pane_idle_shell_pid() {  # <session> <pane-id>
-  local attempt=0 max_attempts=${FM_BACKEND_HERDR_IDLE_SHELL_PROOF_POLLS:-10}
+  local attempt=0 max_attempts=${FM_BACKEND_HERDR_IDLE_SHELL_PROOF_POLLS:-10} rc
   while :; do
-    if fm_backend_herdr_pane_idle_shell_sample "$1" "$2"; then
-      return 0
-    fi
+    rc=0
+    fm_backend_herdr_pane_idle_shell_sample "$1" "$2" || rc=$?
+    [ "$rc" -eq 0 ] && return 0
+    [ "$rc" -eq 2 ] && return 1
     attempt=$((attempt + 1))
     [ "$attempt" -lt "$max_attempts" ] || return 1
     sleep 0.1
@@ -1204,10 +1233,14 @@ fm_backend_herdr_pane_idle_shell_pid() {  # <session> <pane-id>
 
 # fm_backend_herdr_pane_idle_shell_sample: one strict instantaneous
 # observation for fm_backend_herdr_pane_idle_shell_pid, which owns the proof
-# contract and the settle retry.
+# contract and the settle retry. Exit 0 prints the pane shell pid; exit 2
+# means the lone foreground process resolved to a conclusively non-shell
+# program (name and argv0 agree it is not a recognized shell), so the owner
+# may refuse without further settle samples; exit 1 is every other failure
+# and stays retryable.
 fm_backend_herdr_pane_idle_shell_sample() {  # <session> <pane-id>
   local session=$1 pane=$2 info shell_pid foreground_pgid count
-  local process_pid name argv0 shell_name rows stat ps_bin
+  local foreground_pid name argv0 shell_name rows stat ps_bin current parent child_count hops max_hops treehouse_get_count=0
   info=$(fm_backend_herdr_cli "$session" pane process-info --pane "$pane" 2>/dev/null) || return 1
   printf '%s' "$info" | jq -e --arg pane "$pane" '
     .result.type == "pane_process_info"
@@ -1217,13 +1250,12 @@ fm_backend_herdr_pane_idle_shell_sample() {  # <session> <pane-id>
     '.result.process_info.shell_pid | select(type == "number" and . > 1) | floor' 2>/dev/null) || return 1
   foreground_pgid=$(printf '%s' "$info" | jq -er \
     '.result.process_info.foreground_process_group_id | select(type == "number" and . > 1) | floor' 2>/dev/null) || return 1
-  [ "$foreground_pgid" = "$shell_pid" ] || return 1
   count=$(printf '%s' "$info" | jq -er \
     '.result.process_info.foreground_processes | select(type == "array") | length' 2>/dev/null) || return 1
   [ "$count" -eq 1 ] || return 1
-  process_pid=$(printf '%s' "$info" | jq -er \
+  foreground_pid=$(printf '%s' "$info" | jq -er \
     '.result.process_info.foreground_processes[0].pid | select(type == "number") | floor' 2>/dev/null) || return 1
-  [ "$process_pid" = "$shell_pid" ] || return 1
+  [ "$foreground_pgid" = "$foreground_pid" ] || return 1
   name=$(printf '%s' "$info" | jq -er \
     '.result.process_info.foreground_processes[0].name | select(type == "string" and length > 0)' 2>/dev/null) || return 1
   argv0=$(printf '%s' "$info" | jq -er '
@@ -1234,19 +1266,47 @@ fm_backend_herdr_pane_idle_shell_sample() {  # <session> <pane-id>
   shell_name=${name##*/}
   argv0=${argv0#-}
   argv0=${argv0##*/}
-  [ "$argv0" = "$shell_name" ] || return 1
-  case "$shell_name" in sh|bash|zsh|dash|ksh|fish) ;; *) return 1 ;; esac
+  case "$shell_name" in
+    sh|bash|zsh|dash|ksh|fish)
+      [ "$argv0" = "$shell_name" ] || return 1
+      ;;
+    *)
+      case "$argv0" in sh|bash|zsh|dash|ksh|fish) return 1 ;; *) return 2 ;; esac
+      ;;
+  esac
 
   ps_bin=${FM_HERDR_PS_BIN:-ps}
   command -v "$ps_bin" >/dev/null 2>&1 || return 1
   rows=$("$ps_bin" -axo pid=,ppid= 2>/dev/null) || return 1
-  printf '%s\n' "$rows" | awk -v shell="$shell_pid" '
-    $1 == shell { found++ }
-    $2 == shell { child++ }
-    END { exit(found == 1 && child == 0 ? 0 : 1) }
-  ' || return 1
-  stat=$("$ps_bin" -p "$shell_pid" -o stat= 2>/dev/null | tr -d '[:space:]') || return 1
-  case "$stat" in S*|I*) ;; *) return 1 ;; esac
+  max_hops=$(printf '%s\n' "$rows" | awk 'NF { count++ } END { print count + 1 }') || return 1
+  case "$max_hops" in ''|*[!0-9]*) return 1 ;; esac
+  current=$foreground_pid
+  hops=0
+  while :; do
+    hops=$((hops + 1))
+    [ "$hops" -le "$max_hops" ] || return 1
+    if ! fm_backend_herdr_pid_is_bare_shell "$ps_bin" "$current"; then
+      if [ "$current" = "$shell_pid" ] || [ "$current" = "$foreground_pid" ]; then
+        return 1
+      fi
+      fm_backend_herdr_pid_is_treehouse_get "$ps_bin" "$current" || return 1
+      treehouse_get_count=$((treehouse_get_count + 1))
+      [ "$treehouse_get_count" -le 1 ] || return 1
+    fi
+    stat=$("$ps_bin" -p "$current" -o stat= 2>/dev/null | tr -d '[:space:]') || return 1
+    case "$stat" in S*|I*) ;; *) return 1 ;; esac
+    child_count=$(printf '%s\n' "$rows" | awk -v pid="$current" '$2 == pid { count++ } END { print count + 0 }') || return 1
+    if [ "$current" = "$foreground_pid" ]; then
+      [ "$child_count" -eq 0 ] || return 1
+    else
+      [ "$child_count" -eq 1 ] || return 1
+    fi
+    [ "$current" = "$shell_pid" ] && break
+    parent=$(printf '%s\n' "$rows" | awk -v pid="$current" '$1 == pid { if (seen == 0) { print $2; seen = 1 } else dup = 1 } END { if (dup || seen != 1) exit 1 }') || return 1
+    case "$parent" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$parent" -gt 1 ] || return 1
+    current=$parent
+  done
   printf '%s\n' "$shell_pid"
 }
 
@@ -1875,26 +1935,21 @@ fm_backend_herdr_explicit_close_pane_confirmed() {  # <session> <pane_id>
 #              on a live server makes herdr immediately drop both the pane
 #              and its tab from `pane get`/`tab list`).
 #   no-agent - `pane get` succeeds (the pane structurally exists) but `agent
-#              get` responds with error code agent_not_found: nothing is
-#              registered in it - exactly what a herdr session-layout restore
-#              produces (verified empirically: `session stop` + fresh `herdr
-#              server` restart leaves the pane alive, agent_status "unknown",
-#              agent get -> agent_not_found - docs/herdr-backend.md "ID
-#              stability across a server restart"), and what a future
-#              `resume_agents_on_restore = false` restore would produce too
-#              (a plain shell, never an agent).
-#   live     - `agent get` succeeds and reports a real agent_status (working,
-#              idle, done, or blocked - any registered value). An idle or
-#              blocked agent is still a genuine, still-registered agent, not
-#              a restored husk, so it is never a close-and-replace candidate.
+#              get` reports no registration, or a settled idle/done
+#              registration plus the strict idle-shell-chain proof has already
+#              collapsed the pane to one bare shell. That is the conservative
+#              husk the recovery path may close and replace.
+#   live     - `agent get` succeeds and reports a real registered agent_status
+#              (working or blocked), or reports an idle/done registration
+#              whose process-proof could not collapse it to the proven idle
+#              shell chain. A real resumable Pi process and any non-shell foreground
+#              process stay live here.
 #   unknown  - anything else: an unparseable/unexpected response from either
-#              call, or a `pane get` success whose own echoed pane_id does not
-#              round-trip (guards against misreading a herdr response shape
-#              change as "the pane exists"). The caller must fail safe toward
-#              refusal here, never toward closing - this is the conservative
-#              backstop the husk check depends on.
+#              call. The caller must fail safe toward refusal here, never
+#              toward closing - this is the conservative backstop the husk
+#              check depends on.
 fm_backend_herdr_pane_agent_state() {  # <session> <pane_id>
-  local session=$1 pane_id=$2 out code presence status
+  local session=$1 pane_id=$2 out code presence status info
   presence=$(fm_backend_herdr_pane_presence_state "$session" "$pane_id")
   if [ "$presence" != present ]; then
     case "$presence" in
@@ -1911,7 +1966,23 @@ fm_backend_herdr_pane_agent_state() {  # <session> <pane_id>
   fi
   status=$(printf '%s' "$out" | jq -r '.result.agent.agent_status // empty' 2>/dev/null)
   case "$status" in
-    working|idle|done|blocked) printf 'live' ;;
+    working|blocked) printf 'live' ;;
+    idle|done)
+      if fm_backend_herdr_pane_idle_shell_pid "$session" "$pane_id" >/dev/null; then
+        printf 'no-agent'
+        return 0
+      fi
+      info=$(fm_backend_herdr_cli "$session" pane process-info --pane "$pane_id" 2>&1)
+      if ! printf '%s' "$info" | jq -e --arg pane "$pane_id" '
+        .result.type == "pane_process_info"
+        and .result.process_info.pane_id == $pane
+        and (.result.process_info.foreground_processes | type) == "array"
+      ' >/dev/null 2>&1; then
+        printf 'unknown'
+        return 0
+      fi
+      printf 'live'
+      ;;
     *) printf 'unknown' ;;
   esac
 }
@@ -1931,8 +2002,9 @@ fm_backend_herdr_tab_is_husk() {  # <session> <pane_id>
 # fm_backend_herdr_agent_state: recovery-grade state for the same session-start
 # sweep as the tmux classifier. It reuses the husk classifier rather than
 # creating a second Herdr state machine: a structurally gone pane is `missing`,
-# a confirmed agent-less pane is `dead`, a registered agent is `alive`, and an
-# unexpected or failed API read is `unreadable`.
+# a confirmed agent-less pane or settled idle/done shell husk is `dead`, a
+# registered agent with real foreground work is `alive`, and an unexpected or
+# failed API read is `unreadable`.
 fm_backend_herdr_agent_state() {  # <target>
   local target=$1
   fm_backend_herdr_parse_target "$target" || { printf 'unreadable'; return 0; }

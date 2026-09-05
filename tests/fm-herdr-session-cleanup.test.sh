@@ -34,6 +34,7 @@ cat > "$FAKE_PS" <<'SH'
 case "$*" in
   "-axo pid=,ppid=") printf '1 0\n67 1\n' ;;
   "-p 67 -o stat=") printf 'Ss\n' ;;
+  "-p 67 -o comm=") printf 'sh\n' ;;
   *) exit 1 ;;
 esac
 SH
@@ -164,7 +165,7 @@ fm_backend_herdr_cli() {
     "agent get")
       case "$(cat "$FIXTURE_DIR/agent")" in
         absent) printf '%s\n' '{"error":{"code":"agent_not_found"}}' >&2; return 1 ;;
-        live) printf '%s\n' '{"result":{"agent":{"agent_status":"idle"}}}' ;;
+        live) printf '%s\n' '{"result":{"agent":{"agent_status":"working"}}}' ;;
         unknown) printf '%s\n' '{"error":{"code":"internal_error"}}' >&2; return 1 ;;
       esac
       ;;

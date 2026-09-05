@@ -715,6 +715,34 @@ EOF
   pass "fm_backend_herdr_create_task: closes and replaces a same-labeled tab whose pane is alive but hosts no registered agent (a restored plain shell)"
 }
 
+test_create_task_closes_and_replaces_done_shell_husk() {
+  local dir log resp fb out tab pane
+  dir="$TMP_ROOT/husk-done-shell"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
+  printf '{"result":{"tabs":[{"tab_id":"w1:t2","label":"fm-husk3","workspace_id":"w1"}]}}\n' > "$resp/1.out"
+  printf '{"result":{"panes":[{"pane_id":"w1:p2","tab_id":"w1:t2"}]}}\n' > "$resp/2.out"
+  printf '{"result":{"pane":{"pane_id":"w1:p2"}}}\n' > "$resp/3.out"
+  printf '{"result":{"agent":{"agent_status":"done"}}}\n' > "$resp/4.out"
+  death_process_info_fixture w1:p2 67 > "$resp/5.out"
+  printf '{"result":{"tab":{"tab_id":"w1:t3"},"root_pane":{"pane_id":"w1:p3"}}}\n' > "$resp/6.out"
+  printf '{"result":{"tabs":[{"tab_id":"w1:t3","label":"fm-husk3","workspace_id":"w1"}]}}\n' > "$resp/8.out"
+  make_death_lab "$dir" 67
+  fb=$(make_herdr_fakebin "$dir")
+  out=$(PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" FM_HERDR_PS_BIN="$dir/ps" FM_BACKEND_HERDR_IDLE_SHELL_PROOF_POLLS=1 \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_create_task fmtest:w1 fm-husk3 /tmp/proj' "$ROOT") \
+    || fail "create_task should close-and-replace a done shell husk instead of refusing"
+  read -r tab pane <<EOF
+$out
+EOF
+  if [ "$tab" != "w1:t3" ] || [ "$pane" != "w1:p3" ]; then
+    fail "create_task should echo the NEW tab/pane ids, got '$out'"
+  fi
+  assert_contains "$(cat "$log")" $'pane\x1fprocess-info' "create_task did not use the strict idle-shell proof"
+  assert_contains "$(cat "$log")" $'tab\x1fcreate\x1f--workspace\x1fw1\x1f--cwd\x1f/tmp/proj\x1f--label\x1ffm-husk3' \
+    "create_task did not create the replacement tab"
+  assert_contains "$(cat "$log")" $'tab\x1fclose\x1fw1:t2' "create_task did not close the done shell husk's tab"
+  pass "fm_backend_herdr_create_task: closes and replaces a same-labeled tab whose settled done agent collapses to a lone idle shell husk"
+}
+
 test_create_task_closes_all_duplicate_husks_after_replacement() {
   local dir log resp fb out tab pane create_line close_p2_line close_p3_line
   dir="$TMP_ROOT/husk-multiple"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
@@ -1497,21 +1525,38 @@ test_projection_close_rechecks_required_agent_state_at_boundary() {
 # while a pane-death removal preserves focus whenever the dying workspace
 # sits behind the focused one (or the focused one is last).
 
-# make_death_lab <dir> <shell-pid>: a fake ps and a fake workspace mover for
+# make_death_lab <dir> <shell-pid> [<foreground-shell-pid>] [<branch-pid>]: a fake ps and a fake workspace mover for
 # the pane-death close fixtures. The mover appends to $FM_FAKE_MOVER_LOG and
 # exits 9 unless $FM_FAKE_MOVER_RESPONSE names a readable response file.
-make_death_lab() {  # <dir> <shell-pid>
-  local dir=$1 pid=$2
+make_death_lab() {  # <dir> <shell-pid> [<foreground-shell-pid>] [<branch-pid>]
+  local dir=$1 shell_pid=$2 foreground_pid=${3:-$2} branch_pid=${4:-}
   mkdir -p "$dir"
-  cat > "$dir/ps" <<SH
+  if [ "$foreground_pid" = "$shell_pid" ]; then
+    cat > "$dir/ps" <<SH
 #!/usr/bin/env bash
 case "\$*" in
-  "-axo pid=,ppid=") printf '1 0\n$pid 1\n' ;;
-  "-p $pid -o stat=") printf 'Ss+\n' ;;
-  "-p $pid -o comm=") printf -- '-zsh\n' ;;
+  "-axo pid=,ppid=") printf '1 0\n$shell_pid 1\n' ;;
+  "-p $shell_pid -o stat=") printf 'Ss+\n' ;;
+  "-p $shell_pid -o comm=") printf -- '-zsh\n' ;;
   *) exit 1 ;;
 esac
 SH
+  else
+    cat > "$dir/ps" <<SH
+#!/usr/bin/env bash
+case "\$*" in
+  "-axo pid=,ppid=")
+    printf '1 0\n$shell_pid 1\n$foreground_pid $shell_pid\n'
+    if [ -n "$branch_pid" ]; then printf '%s %s\n' "$branch_pid" "$shell_pid"; fi
+    ;;
+  "-p $shell_pid -o stat=") printf 'Ss+\n' ;;
+  "-p $foreground_pid -o stat=") printf 'Ss+\n' ;;
+  "-p $shell_pid -o comm=") printf -- '-zsh\n' ;;
+  "-p $foreground_pid -o comm=") printf -- '-zsh\n' ;;
+  *) exit 1 ;;
+esac
+SH
+  fi
   cat > "$dir/mover" <<'SH'
 #!/usr/bin/env bash
 printf '%s\t%s\t%s\n' "$1" "$2" "$3" >> "$FM_FAKE_MOVER_LOG"
@@ -1530,8 +1575,54 @@ SH
   : > "$dir/mover.log"
 }
 
+# make_treehouse_death_lab <dir> <shell-pid> <treehouse-pid>
+# <foreground-shell-pid> [<treehouse-args>]: model the real pooled-worktree
+# process chain: pane shell -> `treehouse get` -> foreground shell.
+make_treehouse_death_lab() {
+  local dir=$1 shell_pid=$2 treehouse_pid=$3 foreground_pid=$4 treehouse_args=${5:-treehouse get}
+  mkdir -p "$dir"
+  cat > "$dir/ps" <<SH
+#!/usr/bin/env bash
+case "\$*" in
+  "-axo pid=,ppid=") printf '1 0\n$shell_pid 1\n$treehouse_pid $shell_pid\n$foreground_pid $treehouse_pid\n' ;;
+  "-p $shell_pid -o stat="|"-p $treehouse_pid -o stat="|"-p $foreground_pid -o stat=") printf 'S\n' ;;
+  "-p $shell_pid -o comm="|"-p $foreground_pid -o comm=") printf -- '-zsh\n' ;;
+  "-p $treehouse_pid -o comm=") printf 'treehouse\n' ;;
+  "-p $treehouse_pid -o args=") printf '%s\n' '$treehouse_args' ;;
+  *) exit 1 ;;
+esac
+SH
+  chmod +x "$dir/ps"
+}
+
+make_refusal_ps_stub() {  # <dir> -> echoes a ps stub that never confirms the proof
+  local dir=$1
+  cat > "$dir/ps" <<'SH'
+#!/usr/bin/env bash
+exit 1
+SH
+  chmod +x "$dir/ps"
+}
+
+process_info_fixture() {  # <pane> <shell-pid> [<foreground-pid>] <name> <argv0>
+  local pane=$1 shell_pid=$2 foreground_pid=$2 name argv0
+  case $# in
+    4)
+      name=$3
+      argv0=$4
+      ;;
+    5)
+      foreground_pid=$3
+      name=$4
+      argv0=$5
+      ;;
+    *) return 1 ;;
+  esac
+  printf '{"result":{"type":"pane_process_info","process_info":{"pane_id":"%s","shell_pid":%s,"foreground_process_group_id":%s,"foreground_processes":[{"pid":%s,"name":"%s","argv0":"%s"}]}}}\n' "$pane" "$shell_pid" "$foreground_pid" "$foreground_pid" "$name" "$argv0"
+}
+
 death_process_info_fixture() {  # <pane> <pid>
-  printf '{"result":{"type":"pane_process_info","process_info":{"pane_id":"%s","shell_pid":%s,"foreground_process_group_id":%s,"foreground_processes":[{"pid":%s,"name":"zsh","argv0":"zsh"}]}}}\n' "$1" "$2" "$2" "$2"
+  process_info_fixture "$1" "$2" zsh zsh
 }
 
 test_projection_close_emptying_after_focus_uses_pane_death_without_move() {
@@ -2825,7 +2916,9 @@ test_projection_recovery_is_read_only_and_refuses_live_duplicate_risk() {
   printf '{"result":{"panes":[{"pane_id":"w1:p1","tab_id":"w1:t1"}]}}\n' > "$resp/2.out"
   printf '{"result":{"pane":{"pane_id":"w1:p1"}}}\n' > "$resp/3.out"
   printf '{"result":{"agent":{"agent_status":"idle"}}}\n' > "$resp/4.out"
-  out=$(PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
+  process_info_fixture w1:p1 67 sleep sleep > "$resp/5.out"
+  process_info_fixture w1:p1 67 sleep sleep > "$resp/6.out"
+  out=$(PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" FM_BACKEND_HERDR_IDLE_SHELL_PROOF_POLLS=1 \
     bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_projection_recovery_allows_flat fmtest "$1" task-p3' "$ROOT" "$journal" 2>&1)
   status=$?
   [ "$status" -ne 0 ] || fail "a token match with a live registered agent must refuse duplicate launch"
@@ -3033,6 +3126,263 @@ test_busy_state_unknown_on_no_agent() {
     bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_busy_state default:w1:p2' "$ROOT" )
   [ "$out" = unknown ] || fail "a failed agent get should report unknown (the fallback-to-regex cue), got '$out'"
   pass "fm_backend_herdr_busy_state: unparseable/absent agent state reports unknown, the regex-fallback cue"
+}
+
+test_pane_agent_state_done_lone_idle_shell_becomes_no_agent() {
+  local dir log resp fb out shell_log_count
+  dir="$TMP_ROOT/pane-state-done-shell"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
+  printf '{"result":{"pane":{"pane_id":"w1:p2"}}}\n' > "$resp/1.out"
+  printf '{"result":{"agent":{"agent_status":"done"}}}\n' > "$resp/2.out"
+  death_process_info_fixture w1:p2 67 > "$resp/3.out"
+  printf '{"result":{"pane":{"pane_id":"w1:p2"}}}\n' > "$resp/4.out"
+  printf '{"result":{"agent":{"agent_status":"done"}}}\n' > "$resp/5.out"
+  death_process_info_fixture w1:p2 67 > "$resp/6.out"
+  make_death_lab "$dir" 67
+  fb=$(make_herdr_fakebin "$dir")
+  out=$(PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" FM_HERDR_PS_BIN="$dir/ps" FM_BACKEND_HERDR_IDLE_SHELL_PROOF_POLLS=1 \
+    bash -c '. "$0/bin/backends/herdr.sh"; printf "%s\t%s\n" "$(fm_backend_herdr_pane_agent_state fmtest w1:p2)" "$(fm_backend_herdr_agent_state fmtest:w1:p2)"' "$ROOT")
+  [ "$out" = $'no-agent\tdead' ] || fail "settled done+shell should collapse to no-agent/dead, got: $out"
+  shell_log_count=$(grep -c $'pane\x1fprocess-info' "$log")
+  [ "$shell_log_count" -eq 2 ] || fail "the lone-shell proof should use one process-info read per classification call, got $shell_log_count"
+  pass "herdr recovery: a done registration on one lone idle shell becomes no-agent/dead"
+}
+
+
+# --- nested shell chains: treehouse-style recovery husks --------------------
+
+# A preserved task pane can come back as a nested shell chain: the pane shell
+# still exists, but the visible foreground shell is a child shell in the same
+# worktree. The proof must return the pane shell pid, not refuse just because
+# the foreground pid differs.
+test_pane_idle_shell_pid_accepts_nested_linear_shell_chain() {
+  local dir log resp fb out root_pid=84605 leaf_pid=85430
+  dir="$TMP_ROOT/pane-state-nested-chain"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
+  process_info_fixture w1:p2 "$root_pid" "$leaf_pid" zsh zsh > "$resp/1.out"
+  make_death_lab "$dir" "$root_pid" "$leaf_pid"
+  fb=$(make_herdr_fakebin "$dir")
+  out=$(PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" FM_HERDR_PS_BIN="$dir/ps" FM_BACKEND_HERDR_IDLE_SHELL_PROOF_POLLS=1 \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_pane_idle_shell_pid fmtest w1:p2' "$ROOT")
+  [ "$out" = "$root_pid" ] || fail "a nested idle shell chain should return the pane shell pid $root_pid, got: $out"
+  pass "herdr recovery: a nested idle shell chain still yields the pane shell pid"
+}
+
+# The control-plane classification must collapse a settled done registration on
+# a nested shell chain to dead/no-agent, not keep calling it live just because
+# the pane shell has a child shell in the same worktree.
+test_pane_agent_state_done_nested_shell_chain_collapses() {
+  local dir log resp fb out shell_log_count root_pid=84605 leaf_pid=85430
+  dir="$TMP_ROOT/pane-state-done-nested-chain"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
+  printf '{"result":{"pane":{"pane_id":"w1:p2"}}}\n' > "$resp/1.out"
+  printf '{"result":{"agent":{"agent_status":"done"}}}\n' > "$resp/2.out"
+  process_info_fixture w1:p2 "$root_pid" "$leaf_pid" zsh zsh > "$resp/3.out"
+  printf '{"result":{"pane":{"pane_id":"w1:p2"}}}\n' > "$resp/4.out"
+  printf '{"result":{"agent":{"agent_status":"done"}}}\n' > "$resp/5.out"
+  process_info_fixture w1:p2 "$root_pid" "$leaf_pid" zsh zsh > "$resp/6.out"
+  make_death_lab "$dir" "$root_pid" "$leaf_pid"
+  fb=$(make_herdr_fakebin "$dir")
+  out=$(PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" FM_HERDR_PS_BIN="$dir/ps" FM_BACKEND_HERDR_IDLE_SHELL_PROOF_POLLS=1 \
+    bash -c '. "$0/bin/backends/herdr.sh"; printf "%s\t%s\n" "$(fm_backend_herdr_pane_agent_state fmtest w1:p2)" "$(fm_backend_herdr_agent_state fmtest:w1:p2)"' "$ROOT")
+  [ "$out" = $'no-agent\tdead' ] || fail "settled done+nested-shell should collapse to no-agent/dead, got: $out"
+  shell_log_count=$(grep -c $'pane\x1fprocess-info' "$log")
+  [ "$shell_log_count" -eq 2 ] || fail "the nested-shell proof should use one process-info read per classification call, got $shell_log_count"
+  pass "herdr recovery: a done registration on a nested shell chain becomes no-agent/dead"
+}
+
+# Treehouse's interactive `get` keeps one sleeping wrapper between the pane
+# shell and the pooled-worktree shell. This is the real chain the recovery must
+# accept, not merely a direct shell child described as Treehouse-shaped.
+test_pane_agent_state_done_treehouse_get_chain_collapses() {
+  local dir log resp fb out shell_log_count root_pid=84605 treehouse_pid=85390 leaf_pid=85430
+  dir="$TMP_ROOT/pane-state-done-treehouse-chain"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
+  printf '{"result":{"pane":{"pane_id":"w1:p2"}}}\n' > "$resp/1.out"
+  printf '{"result":{"agent":{"agent_status":"done"}}}\n' > "$resp/2.out"
+  process_info_fixture w1:p2 "$root_pid" "$leaf_pid" zsh zsh > "$resp/3.out"
+  printf '{"result":{"pane":{"pane_id":"w1:p2"}}}\n' > "$resp/4.out"
+  printf '{"result":{"agent":{"agent_status":"done"}}}\n' > "$resp/5.out"
+  process_info_fixture w1:p2 "$root_pid" "$leaf_pid" zsh zsh > "$resp/6.out"
+  make_treehouse_death_lab "$dir" "$root_pid" "$treehouse_pid" "$leaf_pid"
+  fb=$(make_herdr_fakebin "$dir")
+  out=$(PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" FM_HERDR_PS_BIN="$dir/ps" FM_BACKEND_HERDR_IDLE_SHELL_PROOF_POLLS=1 \
+    bash -c '. "$0/bin/backends/herdr.sh"; printf "%s\t%s\n" "$(fm_backend_herdr_pane_agent_state fmtest w1:p2)" "$(fm_backend_herdr_agent_state fmtest:w1:p2)"' "$ROOT")
+  [ "$out" = $'no-agent\tdead' ] || fail "settled done+treehouse-get shell chain should collapse to no-agent/dead, got: $out"
+  shell_log_count=$(grep -c $'pane\x1fprocess-info' "$log")
+  [ "$shell_log_count" -eq 2 ] || fail "the treehouse-get proof should use one process-info read per classification call, got $shell_log_count"
+  pass "herdr recovery: a done registration on a treehouse-get shell chain becomes no-agent/dead"
+}
+
+# A Treehouse process is not generically safe. Only the exact interactive
+# `treehouse get` wrapper is admitted; every other subcommand remains live.
+test_pane_agent_state_done_other_treehouse_command_remains_live() {
+  local dir log resp fb out root_pid=84605 treehouse_pid=85390 leaf_pid=85430
+  dir="$TMP_ROOT/pane-state-done-treehouse-other"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
+  printf '{"result":{"pane":{"pane_id":"w1:p2"}}}\n' > "$resp/1.out"
+  printf '{"result":{"agent":{"agent_status":"done"}}}\n' > "$resp/2.out"
+  process_info_fixture w1:p2 "$root_pid" "$leaf_pid" zsh zsh > "$resp/3.out"
+  process_info_fixture w1:p2 "$root_pid" "$leaf_pid" zsh zsh > "$resp/4.out"
+  printf '{"result":{"pane":{"pane_id":"w1:p2"}}}\n' > "$resp/5.out"
+  printf '{"result":{"agent":{"agent_status":"done"}}}\n' > "$resp/6.out"
+  process_info_fixture w1:p2 "$root_pid" "$leaf_pid" zsh zsh > "$resp/7.out"
+  process_info_fixture w1:p2 "$root_pid" "$leaf_pid" zsh zsh > "$resp/8.out"
+  make_treehouse_death_lab "$dir" "$root_pid" "$treehouse_pid" "$leaf_pid" "treehouse run"
+  fb=$(make_herdr_fakebin "$dir")
+  out=$(PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" FM_HERDR_PS_BIN="$dir/ps" FM_BACKEND_HERDR_IDLE_SHELL_PROOF_POLLS=1 \
+    bash -c '. "$0/bin/backends/herdr.sh"; printf "%s\t%s\n" "$(fm_backend_herdr_pane_agent_state fmtest w1:p2)" "$(fm_backend_herdr_agent_state fmtest:w1:p2)"' "$ROOT")
+  [ "$out" = $'live\talive' ] || fail "a non-get Treehouse command should stay live/alive, got: $out"
+  pass "herdr recovery: a non-get Treehouse wrapper stays live/alive"
+}
+
+# The one admitted `treehouse get` wrapper may only sit between the pane shell
+# and the foreground shell. A pane whose registered shell pid is itself the
+# sleeping wrapper has no recognized bare-shell chain root and must stay live
+# instead of classifying as a recoverable husk.
+test_pane_agent_state_done_treehouse_root_wrapper_remains_live() {
+  local dir log resp fb out root_pid=84605 treehouse_pid=85390 leaf_pid=85430
+  dir="$TMP_ROOT/pane-state-done-treehouse-root"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
+  printf '{"result":{"pane":{"pane_id":"w1:p2"}}}\n' > "$resp/1.out"
+  printf '{"result":{"agent":{"agent_status":"done"}}}\n' > "$resp/2.out"
+  process_info_fixture w1:p2 "$treehouse_pid" "$leaf_pid" zsh zsh > "$resp/3.out"
+  process_info_fixture w1:p2 "$treehouse_pid" "$leaf_pid" zsh zsh > "$resp/4.out"
+  printf '{"result":{"pane":{"pane_id":"w1:p2"}}}\n' > "$resp/5.out"
+  printf '{"result":{"agent":{"agent_status":"done"}}}\n' > "$resp/6.out"
+  process_info_fixture w1:p2 "$treehouse_pid" "$leaf_pid" zsh zsh > "$resp/7.out"
+  process_info_fixture w1:p2 "$treehouse_pid" "$leaf_pid" zsh zsh > "$resp/8.out"
+  make_treehouse_death_lab "$dir" "$root_pid" "$treehouse_pid" "$leaf_pid"
+  fb=$(make_herdr_fakebin "$dir")
+  out=$(PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" FM_HERDR_PS_BIN="$dir/ps" FM_BACKEND_HERDR_IDLE_SHELL_PROOF_POLLS=1 \
+    bash -c '. "$0/bin/backends/herdr.sh"; printf "%s\t%s\n" "$(fm_backend_herdr_pane_agent_state fmtest w1:p2)" "$(fm_backend_herdr_agent_state fmtest:w1:p2)"' "$ROOT")
+  [ "$out" = $'live\talive' ] || fail "a chain rooted at the treehouse-get wrapper should stay live/alive, got: $out"
+  pass "herdr recovery: a chain rooted at the treehouse-get wrapper stays live/alive"
+}
+
+# A branching shell tree is ambiguous and must stay live/unknown instead of
+# being mistaken for the recoverable nested-shell chain.
+test_pane_agent_state_done_branching_shell_chain_remains_live() {
+  local dir log resp fb out shell_log_count root_pid=84605 leaf_pid=85430 branch_pid=99999
+  dir="$TMP_ROOT/pane-state-done-branching-chain"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
+  printf '{"result":{"pane":{"pane_id":"w1:p2"}}}\n' > "$resp/1.out"
+  printf '{"result":{"agent":{"agent_status":"done"}}}\n' > "$resp/2.out"
+  process_info_fixture w1:p2 "$root_pid" "$leaf_pid" zsh zsh > "$resp/3.out"
+  process_info_fixture w1:p2 "$root_pid" "$leaf_pid" zsh zsh > "$resp/4.out"
+  printf '{"result":{"pane":{"pane_id":"w1:p2"}}}\n' > "$resp/5.out"
+  printf '{"result":{"agent":{"agent_status":"done"}}}\n' > "$resp/6.out"
+  process_info_fixture w1:p2 "$root_pid" "$leaf_pid" zsh zsh > "$resp/7.out"
+  process_info_fixture w1:p2 "$root_pid" "$leaf_pid" zsh zsh > "$resp/8.out"
+  make_death_lab "$dir" "$root_pid" "$leaf_pid" "$branch_pid"
+  fb=$(make_herdr_fakebin "$dir")
+  out=$(PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" FM_HERDR_PS_BIN="$dir/ps" FM_BACKEND_HERDR_IDLE_SHELL_PROOF_POLLS=1 \
+    bash -c '. "$0/bin/backends/herdr.sh"; printf "%s\t%s\n" "$(fm_backend_herdr_pane_agent_state fmtest w1:p2)" "$(fm_backend_herdr_agent_state fmtest:w1:p2)"' "$ROOT")
+  [ "$out" = $'live\talive' ] || fail "a branching shell chain should stay live/alive, got: $out"
+  shell_log_count=$(grep -c $'pane\x1fprocess-info' "$log")
+  [ "$shell_log_count" -eq 4 ] || fail "the branching chain should be retried and then refused on both classifications, got $shell_log_count process-info reads"
+  pass "herdr recovery: branching shell chains stay live/alive rather than being mistaken for husks"
+}
+
+test_pane_agent_state_done_real_pi_foreground_remains_live() {
+  local dir log resp fb out shell_log_count
+  dir="$TMP_ROOT/pane-state-done-pi"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
+  printf '{"result":{"pane":{"pane_id":"w1:p2"}}}\n' > "$resp/1.out"
+  printf '{"result":{"agent":{"agent_status":"done"}}}\n' > "$resp/2.out"
+  process_info_fixture w1:p2 67 pi pi > "$resp/3.out"
+  process_info_fixture w1:p2 67 pi pi > "$resp/4.out"
+  printf '{"result":{"pane":{"pane_id":"w1:p2"}}}\n' > "$resp/5.out"
+  printf '{"result":{"agent":{"agent_status":"done"}}}\n' > "$resp/6.out"
+  process_info_fixture w1:p2 67 pi pi > "$resp/7.out"
+  process_info_fixture w1:p2 67 pi pi > "$resp/8.out"
+  make_refusal_ps_stub "$dir"
+  fb=$(make_herdr_fakebin "$dir")
+  out=$(PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" FM_HERDR_PS_BIN="$dir/ps" FM_BACKEND_HERDR_IDLE_SHELL_PROOF_POLLS=1 \
+    bash -c '. "$0/bin/backends/herdr.sh"; printf "%s\t%s\n" "$(fm_backend_herdr_pane_agent_state fmtest w1:p2)" "$(fm_backend_herdr_agent_state fmtest:w1:p2)"' "$ROOT")
+  [ "$out" = $'live\talive' ] || fail "a real Pi foreground process should stay live/alive, got: $out"
+  shell_log_count=$(grep -c $'pane\x1fprocess-info' "$log")
+  [ "$shell_log_count" -eq 4 ] || fail "the live Pi fallback should re-read process-info after the failed shell proof on both classifications, got $shell_log_count"
+  pass "herdr recovery: a settled Pi foreground process remains live/alive"
+}
+
+test_pane_agent_state_idle_non_shell_foreground_remains_live() {
+  local dir log resp fb out shell_log_count
+  dir="$TMP_ROOT/pane-state-idle-sleep"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
+  printf '{"result":{"pane":{"pane_id":"w1:p2"}}}\n' > "$resp/1.out"
+  printf '{"result":{"agent":{"agent_status":"idle"}}}\n' > "$resp/2.out"
+  process_info_fixture w1:p2 67 sleep sleep > "$resp/3.out"
+  process_info_fixture w1:p2 67 sleep sleep > "$resp/4.out"
+  printf '{"result":{"pane":{"pane_id":"w1:p2"}}}\n' > "$resp/5.out"
+  printf '{"result":{"agent":{"agent_status":"idle"}}}\n' > "$resp/6.out"
+  process_info_fixture w1:p2 67 sleep sleep > "$resp/7.out"
+  process_info_fixture w1:p2 67 sleep sleep > "$resp/8.out"
+  make_refusal_ps_stub "$dir"
+  fb=$(make_herdr_fakebin "$dir")
+  out=$(PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" FM_HERDR_PS_BIN="$dir/ps" FM_BACKEND_HERDR_IDLE_SHELL_PROOF_POLLS=1 \
+    bash -c '. "$0/bin/backends/herdr.sh"; printf "%s\t%s\n" "$(fm_backend_herdr_pane_agent_state fmtest w1:p2)" "$(fm_backend_herdr_agent_state fmtest:w1:p2)"' "$ROOT")
+  [ "$out" = $'live\talive' ] || fail "a non-shell foreground process should stay live/alive, got: $out"
+  shell_log_count=$(grep -c $'pane\x1fprocess-info' "$log")
+  [ "$shell_log_count" -eq 4 ] || fail "the non-shell fallback should re-read process-info after the failed shell proof on both classifications, got $shell_log_count"
+  pass "herdr recovery: a non-shell foreground process remains live/alive"
+}
+
+# A conclusively non-shell lone foreground process (a live harness like pi)
+# must classify live on the FIRST proof sample even with a multi-poll settle
+# budget: the retry window exists only for transient shell-shaped ambiguity.
+# The query count is the proof - one process-info read for the shell proof
+# plus one for the live fallback, per classification, never one per poll.
+test_pane_agent_state_pi_foreground_fails_fast_within_poll_budget() {
+  local dir log resp fb out shell_log_count
+  dir="$TMP_ROOT/pane-state-pi-fail-fast"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
+  printf '{"result":{"pane":{"pane_id":"w1:p2"}}}\n' > "$resp/1.out"
+  printf '{"result":{"agent":{"agent_status":"idle"}}}\n' > "$resp/2.out"
+  process_info_fixture w1:p2 67 pi pi > "$resp/3.out"
+  process_info_fixture w1:p2 67 pi pi > "$resp/4.out"
+  printf '{"result":{"pane":{"pane_id":"w1:p2"}}}\n' > "$resp/5.out"
+  printf '{"result":{"agent":{"agent_status":"idle"}}}\n' > "$resp/6.out"
+  process_info_fixture w1:p2 67 pi pi > "$resp/7.out"
+  process_info_fixture w1:p2 67 pi pi > "$resp/8.out"
+  make_refusal_ps_stub "$dir"
+  fb=$(make_herdr_fakebin "$dir")
+  out=$(PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" FM_HERDR_PS_BIN="$dir/ps" FM_BACKEND_HERDR_IDLE_SHELL_PROOF_POLLS=5 \
+    bash -c '. "$0/bin/backends/herdr.sh"; printf "%s\t%s\n" "$(fm_backend_herdr_pane_agent_state fmtest w1:p2)" "$(fm_backend_herdr_agent_state fmtest:w1:p2)"' "$ROOT")
+  [ "$out" = $'live\talive' ] || fail "a live pi foreground should stay live/alive under a multi-poll budget, got: $out"
+  shell_log_count=$(grep -c $'pane\x1fprocess-info' "$log")
+  [ "$shell_log_count" -eq 4 ] || fail "a conclusively non-shell foreground should refuse on the first proof sample, got $shell_log_count process-info reads"
+  pass "herdr recovery: a live pi foreground classifies live on the first proof sample without burning the settle budget"
+}
+
+# The settle retry itself must survive the fail-fast: a transient prompt
+# helper (the lab-verified starship redraw) makes the shell-shaped sample
+# ambiguous, and the very next clean sample must still complete the proof.
+test_pane_idle_shell_pid_retries_transient_prompt_helper_sample() {
+  local dir log resp fb out shell_log_count
+  dir="$TMP_ROOT/pane-state-prompt-helper"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
+  printf '{"result":{"type":"pane_process_info","process_info":{"pane_id":"w1:p2","shell_pid":67,"foreground_process_group_id":67,"foreground_processes":[{"pid":67,"name":"zsh","argv0":"zsh"},{"pid":68,"name":"starship","argv0":"starship"}]}}}\n' > "$resp/1.out"
+  death_process_info_fixture w1:p2 67 > "$resp/2.out"
+  make_death_lab "$dir" 67
+  fb=$(make_herdr_fakebin "$dir")
+  out=$(PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" FM_HERDR_PS_BIN="$dir/ps" FM_BACKEND_HERDR_IDLE_SHELL_PROOF_POLLS=3 \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_pane_idle_shell_pid fmtest w1:p2' "$ROOT") \
+    || fail "a transient prompt-helper sample followed by a clean sample should still prove the idle shell"
+  [ "$out" = 67 ] || fail "the settled proof should return the pane shell pid, got: $out"
+  shell_log_count=$(grep -c $'pane\x1fprocess-info' "$log")
+  [ "$shell_log_count" -eq 2 ] || fail "the transient sample should be retried exactly once before the clean sample succeeds, got $shell_log_count process-info reads"
+  pass "herdr recovery: a transient prompt-helper sample still settles to the proven idle shell"
+}
+
+test_pane_agent_state_unreadable_process_proof_refuses() {
+  local dir log resp fb out shell_log_count
+  dir="$TMP_ROOT/pane-state-unreadable"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
+  printf '{"result":{"pane":{"pane_id":"w1:p2"}}}\n' > "$resp/1.out"
+  printf '{"result":{"agent":{"agent_status":"done"}}}\n' > "$resp/2.out"
+  printf '{"result":{"type":"pane_process_info","process_info":{"pane_id":"w1:p2","shell_pid":67,"foreground_process_group_id":67}}}\n' > "$resp/3.out"
+  printf '{"result":{"type":"pane_process_info","process_info":{"pane_id":"w1:p2","shell_pid":67,"foreground_process_group_id":67}}}\n' > "$resp/4.out"
+  printf '{"result":{"pane":{"pane_id":"w1:p2"}}}\n' > "$resp/5.out"
+  printf '{"result":{"agent":{"agent_status":"done"}}}\n' > "$resp/6.out"
+  printf '{"result":{"type":"pane_process_info","process_info":{"pane_id":"w1:p2","shell_pid":67,"foreground_process_group_id":67}}}\n' > "$resp/7.out"
+  printf '{"result":{"type":"pane_process_info","process_info":{"pane_id":"w1:p2","shell_pid":67,"foreground_process_group_id":67}}}\n' > "$resp/8.out"
+  make_refusal_ps_stub "$dir"
+  fb=$(make_herdr_fakebin "$dir")
+  out=$(PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" FM_HERDR_PS_BIN="$dir/ps" FM_BACKEND_HERDR_IDLE_SHELL_PROOF_POLLS=1 \
+    bash -c '. "$0/bin/backends/herdr.sh"; printf "%s\t%s\n" "$(fm_backend_herdr_pane_agent_state fmtest w1:p2)" "$(fm_backend_herdr_agent_state fmtest:w1:p2)"' "$ROOT")
+  [ "$out" = $'unknown\tunreadable' ] || fail "an unreadable process proof should refuse recovery, got: $out"
+  shell_log_count=$(grep -c $'pane\x1fprocess-info' "$log")
+  [ "$shell_log_count" -eq 4 ] || fail "the unreadable proof should be retried and then refused on both classifications, got $shell_log_count process-info reads"
+  pass "herdr recovery: unreadable process evidence refuses rather than being treated as stopped"
 }
 
 # --- composer_state: structural border-row classification --------------------
@@ -4513,6 +4863,7 @@ test_create_task_refuses_duplicate_label_when_agent_live
 test_create_task_refuses_when_any_duplicate_label_is_live
 test_create_task_closes_and_replaces_dead_pane_husk
 test_create_task_closes_and_replaces_no_agent_husk
+test_create_task_closes_and_replaces_done_shell_husk
 test_create_task_closes_all_duplicate_husks_after_replacement
 test_create_task_refuses_when_preexisting_husk_tab_remains
 test_create_task_refuses_when_agent_state_ambiguous
@@ -4590,6 +4941,18 @@ test_current_path_reads_cwd
 test_busy_state_working_maps_to_busy
 test_busy_state_done_and_blocked_map_to_idle
 test_busy_state_unknown_on_no_agent
+test_pane_agent_state_done_lone_idle_shell_becomes_no_agent
+test_pane_idle_shell_pid_accepts_nested_linear_shell_chain
+test_pane_agent_state_done_nested_shell_chain_collapses
+test_pane_agent_state_done_treehouse_get_chain_collapses
+test_pane_agent_state_done_other_treehouse_command_remains_live
+test_pane_agent_state_done_treehouse_root_wrapper_remains_live
+test_pane_agent_state_done_branching_shell_chain_remains_live
+test_pane_agent_state_done_real_pi_foreground_remains_live
+test_pane_agent_state_idle_non_shell_foreground_remains_live
+test_pane_agent_state_pi_foreground_fails_fast_within_poll_budget
+test_pane_idle_shell_pid_retries_transient_prompt_helper_sample
+test_pane_agent_state_unreadable_process_proof_refuses
 test_composer_state_bare_prompt_is_empty
 test_composer_state_styled_placeholder_draft_is_pending
 test_composer_state_real_text_is_pending
